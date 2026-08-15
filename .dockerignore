@@ -1,0 +1,70 @@
+# web_demo/.dockerignore
+# Docker build context MUST be scoped to web_demo/ (see README).
+# This file is an additional defence-in-depth layer. If the context is ever
+# accidentally widened, these patterns still block private/production data.
+
+# --- Never ship secrets ---------------------------------------------------
+.env
+.env.*
+*.key
+*.pem
+secrets*
+
+# --- Never ship desktop / production private data -------------------------
+../data
+../data/private
+../storage
+../index
+../reports
+../.backup_baseline
+../app.db
+../desktop
+../packaging
+../dist
+../build
+../scripts
+data/private/
+storage/
+index/
+reports/
+.backup_baseline/
+app.db
+*.faiss
+*.pkl
+chunks.pkl
+chunks.json
+*.pdf
+*.dmg
+*.app
+
+# --- Build artifacts / binaries -------------------------------------------
+node_modules/
+target/
+*.spec
+
+# --- Python noise ---------------------------------------------------------
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# --- Tests are not needed in the runtime image ----------------------------
+tests/
+
+# --- Ephemeral runtime data -----------------------------------------------
+/tmp/mudqeq_demo/
+mudqeq_demo/
+storage/
+uploads/
+temp/
+hf_cache/
+.cache/
+
+# --- OS -------------------------------------------------------------------
+.DS_Store
+
+# --- Docs not needed at runtime -------------------------------------------
+README.md

@@ -1,0 +1,35 @@
+# web_demo/.streamlit/config.toml
+# Streamlit configuration for the PUBLIC demo running on Hugging Face
+# Docker Spaces.
+
+[server]
+headless = true
+# HF Docker Spaces expose a single port; Streamlit must bind 0.0.0.0:7860.
+address = "0.0.0.0"
+port = 7860
+# Disable the local-source file watcher (also avoids noisy transformers
+# introspection tracebacks on startup).
+fileWatcherType = "none"
+# Keep the upload guard tight; application-level checks enforce the real
+# per-file limit, this is a coarse outer bound (MB).
+maxUploadSize = 15
+# XSRF protection stays ON. HF serves each Space on its own subdomain, so the
+# default same-origin XSRF/CORS behavior works without relaxation.
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+# No usage stats collection.
+gatherUsageStats = false
+
+[client]
+# Never surface Python tracebacks / internal details to public users.
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#c9a24b"
+backgroundColor = "#f5f1e6"
+secondaryBackgroundColor = "#fbf9f2"
+textColor = "#1c2733"

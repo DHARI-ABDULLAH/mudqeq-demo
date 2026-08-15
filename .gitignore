@@ -1,0 +1,41 @@
+# web_demo/.gitignore — keep secrets and ephemeral data out of git
+
+# Secrets (never commit)
+.env
+.env.local
+.env.*.local
+*.key
+
+# Template without secrets — safe to commit
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Ephemeral demo storage (never commit user documents/indexes)
+/tmp/mudqeq_demo/
+mudqeq_demo/
+storage/
+uploads/
+temp/
+*.faiss
+*.pkl
+chunks.json
+document.pdf
+
+# HF model cache (baked at build time, never committed)
+.cache/
+hf_cache/
+models/
+
+# OS
+.DS_Store
+
+# Local virtualenvs
+.venv/
+venv/
