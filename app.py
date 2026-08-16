@@ -24,13 +24,53 @@ The desktop application is NOT imported or affected by this module.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import re
+import sys
+import threading
+from pathlib import Path
 
 import streamlit as st
 
-import config
-from core.logging_utils import log_event
-from services import (
+_DEMO_PACKAGES = {"config", "core", "services", "ui"}
+_STAMP_ATTR = "_mudqeq_demo_source_stamp"
+_LOCK_ATTR = "_mudqeq_demo_reload_lock"
+
+
+def _reload_demo_modules_if_updated() -> None:
+    """Drop cached demo modules whenever this file's source changes.
+
+    Streamlit re-executes app.py from disk on every rerun, but modules already
+    in ``sys.modules`` survive for the life of the process. After a hosted
+    redeploy that leaves a fresh app.py running against stale service/UI
+    modules, which surfaces as AttributeError or silently empty results.
+    Stamping the process with this file's hash forces exactly one clean
+    re-import per deployed version.
+    """
+    lock = getattr(sys, _LOCK_ATTR, None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(sys, _LOCK_ATTR, lock)
+
+    with lock:
+        try:
+            stamp = hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+        except OSError:
+            return
+        if getattr(sys, _STAMP_ATTR, None) == stamp:
+            return
+        setattr(sys, _STAMP_ATTR, stamp)
+        for name in list(sys.modules):
+            if name.split(".")[0] in _DEMO_PACKAGES:
+                sys.modules.pop(name, None)
+
+
+_reload_demo_modules_if_updated()
+
+import config  # noqa: E402
+from core.logging_utils import log_event  # noqa: E402
+from services import (  # noqa: E402
     cleanup_service,
     document_service,
     llm_service,
@@ -38,7 +78,7 @@ from services import (
     security,
     session_service,
 )
-from ui import components, styles
+from ui import components, styles  # noqa: E402
 
 st.set_page_config(
     page_title="المدقق الشامل — نسخة تجريبية",
@@ -200,31 +240,58 @@ def _delete_document(session_id: str, document_id: str) -> None:
     raise RuntimeError("no delete API available")
 
 
+def _note_failure(where: str, exc: BaseException) -> None:
+    """Record the last internal failure so the diagnostics panel can show it."""
+    st.session_state["last_error"] = f"{where}: {type(exc).__name__}: {exc}"
+
+
 def _retrieve(session_id: str, document_ids, query: str, top_k: int) -> list[dict]:
     """Retrieve across documents, tolerating single-doc and multi-doc APIs."""
     ids = [d for d in (document_ids or []) if d != ALL_DOCS and _is_valid_id(d)]
     if not ids:
+        _note_failure("retrieve", ValueError("no valid document ids selected"))
         return []
 
     fn = getattr(retrieval_service, "retrieve", None)
     if fn is None:
+        _note_failure("retrieve", AttributeError("retrieval_service.retrieve missing"))
         return []
 
     # Preferred: multi-document API (accepts a list of ids).
     try:
         return list(fn(session_id, ids, query, top_k=top_k) or [])
-    except Exception:  # noqa: BLE001 - older builds reject a list outright
-        pass
+    except Exception as exc:  # noqa: BLE001 - older builds reject a list outright
+        _note_failure("retrieve(multi)", exc)
 
     # Fallback: legacy single-document API — query each, then merge by score.
     merged: list[dict] = []
     for doc_id in ids:
         try:
             merged.extend(fn(session_id, doc_id, query, top_k=top_k) or [])
-        except Exception:  # noqa: BLE001
-            continue
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("retrieve(single)", exc)
     merged.sort(key=lambda r: r.get("score", 0), reverse=True)
     return merged[:top_k]
+
+
+def _capabilities() -> dict[str, bool]:
+    """Which module APIs are actually loaded in this process."""
+    try:
+        params = inspect.signature(retrieval_service.retrieve).parameters
+        multi_doc = "document_ids" in params
+    except (TypeError, ValueError, AttributeError):
+        multi_doc = False
+    return {
+        "config.TOP_K_MIN": hasattr(config, "TOP_K_MIN"),
+        "config.MAX_FILES_PER_SESSION": hasattr(config, "MAX_FILES_PER_SESSION"),
+        "session_service.list_documents": hasattr(session_service, "list_documents"),
+        "session_service.get_document": hasattr(session_service, "get_document"),
+        "document_service.delete_document": hasattr(
+            document_service, "delete_document"
+        ),
+        "retrieval_service.retrieve(multi-doc)": multi_doc,
+        "components.dashboard": hasattr(components, "dashboard"),
+    }
 
 
 # --- Defensive UI helpers -------------------------------------------------
@@ -635,6 +702,21 @@ def page_about() -> None:
         """
     )
     st.caption(f"الإصدار: {getattr(config, 'DEMO_VERSION', '')}")
+
+    with st.expander("معلومات تقنية"):
+        caps = _capabilities()
+        st.caption("الوحدات المُحمّلة على الخادم:")
+        for name, ok in caps.items():
+            st.markdown(f"- {'✅' if ok else '⚠️'} `{name}`")
+        if not all(caps.values()):
+            st.warning(
+                "بعض الوحدات قديمة في ذاكرة الخادم. أعد تشغيل التطبيق "
+                "(Reboot app) لتحميل أحدث نسخة."
+            )
+        last_error = st.session_state.get("last_error")
+        if last_error:
+            st.caption("آخر خطأ داخلي:")
+            st.code(last_error)
 
 
 PAGES = {
