@@ -133,20 +133,127 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 # Optional override for Azure/proxy deployments. Empty means the SDK default.
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
 
+# Fallback locations when operators nest secrets under a TOML section instead of
+# placing OPENAI_* keys at the top level (a common Streamlit Cloud mistake).
+_OPENAI_KEY_NESTED_PATHS: tuple[tuple[str, ...], ...] = (
+    ("openai", "api_key"),
+    ("openai", "API_KEY"),
+    ("openai", "OPENAI_API_KEY"),
+    ("OPENAI", "API_KEY"),
+    ("OPENAI", "OPENAI_API_KEY"),
+)
+_OPENAI_MODEL_NESTED_PATHS: tuple[tuple[str, ...], ...] = (
+    ("openai", "model"),
+    ("openai", "OPENAI_MODEL"),
+    ("OPENAI", "MODEL"),
+    ("OPENAI", "OPENAI_MODEL"),
+)
 
-def _read_secret(name: str) -> str:
-    """Read a secret from env or Streamlit Cloud secrets (never log the value)."""
-    val = os.environ.get(name, "").strip()
-    if val:
-        return val
+
+def _env_non_empty(name: str) -> str:
+    """Return a stripped env var, treating blank/whitespace as missing."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return ""
+    return raw.strip()
+
+
+def _walk_secrets(node: object, path: tuple[str, ...]) -> str:
+    """Follow a nested ``st.secrets`` path; return a scalar string or ``""``."""
+    for part in path:
+        try:
+            if isinstance(node, dict):
+                node = node[part]
+            elif hasattr(node, "__getitem__"):
+                node = node[part]  # type: ignore[index]
+            else:
+                node = getattr(node, part)
+        except (KeyError, AttributeError, TypeError):
+            return ""
+    if isinstance(node, dict):
+        return ""
+    return str(node).strip()
+
+
+def _read_from_streamlit_secrets(
+    name: str, *, nested_paths: tuple[tuple[str, ...], ...] = ()
+) -> str:
+    """Read a scalar secret from ``st.secrets`` (top-level or nested).
+
+    Never logs or raises. Returns ``""`` when Streamlit is unavailable, secrets
+    are missing, or the key cannot be resolved.
+    """
     try:
         import streamlit as st
+        from streamlit.errors import StreamlitSecretNotFoundError
+    except ImportError:
+        return ""
 
-        if name in st.secrets:
-            return str(st.secrets[name]).strip()
-    except Exception:  # noqa: BLE001 — st.secrets unavailable outside Streamlit
+    try:
+        secrets = st.secrets
+        try:
+            value = secrets[name]
+            if not isinstance(value, dict):
+                text = str(value).strip()
+                if text:
+                    return text
+        except KeyError:
+            pass
+
+        for path in nested_paths:
+            text = _walk_secrets(secrets, path)
+            if text:
+                return text
+    except StreamlitSecretNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 — runtime not ready, malformed secrets, etc.
         pass
     return ""
+
+
+def _read_secret(name: str) -> str:
+    """Read a secret from env or Streamlit Cloud secrets (never log the value).
+
+    Resolution order:
+    1. Non-empty ``os.environ[name]`` (includes values promoted from secrets)
+    2. Top-level ``st.secrets[name]``
+    3. Known nested layouts for OpenAI keys/models
+    """
+    val = _env_non_empty(name)
+    if val:
+        return val
+
+    nested: tuple[tuple[str, ...], ...] = ()
+    if name == "OPENAI_API_KEY":
+        nested = _OPENAI_KEY_NESTED_PATHS
+    elif name == "OPENAI_MODEL":
+        nested = _OPENAI_MODEL_NESTED_PATHS
+
+    return _read_from_streamlit_secrets(name, nested_paths=nested)
+
+
+def _detect_api_key_source() -> str:
+    """Return where the OpenAI key was found — never the key itself."""
+    if _env_non_empty("OPENAI_API_KEY"):
+        return "environment"
+    if _read_from_streamlit_secrets(
+        "OPENAI_API_KEY", nested_paths=_OPENAI_KEY_NESTED_PATHS
+    ):
+        return "st.secrets"
+    return "missing"
+
+
+def openai_config_diagnostics() -> dict[str, str]:
+    """Safe OpenAI configuration metadata for the UI/diagnostics panel."""
+    model = get_openai_model()
+    source = _detect_api_key_source()
+    detected = source != "missing"
+    return {
+        "openai_configured": "yes" if detected else "no",
+        "openai_model": model,
+        "api_key_detected": "yes" if detected else "no",
+        "api_key_source": source,
+    }
 
 
 def get_openai_api_key() -> str:

@@ -400,27 +400,47 @@ def _capabilities() -> dict[str, bool]:
 def _llm_is_configured() -> bool:
     """True when the hosted provider has a key available on the server."""
     fn = getattr(config, "openai_is_configured", None)
-    if fn is None:
-        return False
-    try:
-        return bool(fn())
-    except Exception as exc:  # noqa: BLE001
-        _note_failure("openai_is_configured", exc)
-        return False
+    if fn is not None:
+        try:
+            return bool(fn())
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("openai_is_configured", exc)
+
+    getter = getattr(config, "get_openai_api_key", None)
+    if getter is not None:
+        try:
+            return bool(getter())
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("get_openai_api_key", exc)
+    return False
 
 
 def _llm_diagnostics() -> dict:
     """Provider status for the technical panel. NEVER includes the API key."""
-    getter = getattr(config, "get_openai_model", None)
-    try:
-        model = getter() if getter else ""
-    except Exception as exc:  # noqa: BLE001
-        _note_failure("get_openai_model", exc)
-        model = ""
+    base: dict = {}
+    diag_fn = getattr(config, "openai_config_diagnostics", None)
+    if diag_fn is not None:
+        try:
+            base = diag_fn()
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("openai_config_diagnostics", exc)
+
+    model = base.get("openai_model")
+    if not model:
+        getter = getattr(config, "get_openai_model", None)
+        try:
+            model = getter() if getter else ""
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("get_openai_model", exc)
+            model = ""
+
+    configured = base.get("openai_configured") or ("yes" if _llm_is_configured() else "no")
     return {
+        "OpenAI configured": configured,
+        "OpenAI model": model or getattr(config, "DEFAULT_OPENAI_MODEL", "غير معروف"),
+        "API key detected": base.get("api_key_detected", configured),
+        "API key source": base.get("api_key_source", "missing"),
         "LLM provider": getattr(config, "LLM_PROVIDER", "OpenAI"),
-        "Model": model or getattr(config, "DEFAULT_OPENAI_MODEL", "غير معروف"),
-        "API configured": "yes" if _llm_is_configured() else "no",
         "Max output tokens": getattr(config, "OPENAI_MAX_OUTPUT_TOKENS", None),
         "Max RAG context chars": _cfg_int("MAX_RAG_CONTEXT_CHARS", 6000),
         "Retries (transient faults only)": getattr(config, "OPENAI_MAX_RETRIES", None),
@@ -735,6 +755,8 @@ def page_chat() -> None:
             "المحادثة غير مُهيأة حالياً في هذه النسخة التجريبية. "
             "يمكنك استخدام **البحث** الذي يعمل محلياً على الخادم."
         )
+        with st.expander("تشخيص إعداد OpenAI (آمن — بدون عرض المفتاح)"):
+            st.json(_llm_diagnostics())
 
     _render_history()
 
