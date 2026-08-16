@@ -108,6 +108,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Inject global CSS as early as possible so Cloud toolbar icons never flash in.
+try:
+    styles.inject()
+except Exception:  # noqa: BLE001
+    pass
+
 NAV = [
     ("chat", "المحادثة"),
     ("documents", "المستندات"),
@@ -1027,11 +1033,6 @@ def _warm_streamlit_secrets() -> None:
 
 
 def main() -> None:
-    try:
-        styles.inject()
-    except Exception:  # noqa: BLE001
-        pass
-
     _warm_streamlit_secrets()
 
     fn = getattr(config, "ensure_storage_root", None)
