@@ -10,21 +10,31 @@ the desktop app's UX (multi-document management, selection, search, chat):
       -> extract -> chunk -> embed -> FAISS (per document)
       -> select documents -> search (local) / chat (Groq hosted LLM)
 
+Resilience note
+---------------
+Streamlit re-executes THIS file from disk on every rerun, but already-imported
+modules stay cached in ``sys.modules`` for the life of the process. On hosted
+deploys that can leave a fresh app.py running against older service/UI modules.
+Every cross-module call below therefore goes through a small defensive helper
+that falls back to the previous API (or an inline implementation) instead of
+raising AttributeError/TypeError.
+
 The desktop application is NOT imported or affected by this module.
 """
 
 from __future__ import annotations
 
+import re
+
 import streamlit as st
 
 import config
-import app_config
-import compat
 from core.logging_utils import log_event
 from services import (
     cleanup_service,
     document_service,
     llm_service,
+    retrieval_service,
     security,
     session_service,
 )
@@ -45,15 +55,262 @@ NAV = [
 ]
 
 ALL_DOCS = "__all__"
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
 
 
+# --- Defensive config accessors -------------------------------------------
+def _cfg_int(name: str, default: int) -> int:
+    try:
+        return int(getattr(config, name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _top_k_min() -> int:
+    return max(1, _cfg_int("TOP_K_MIN", 2))
+
+
+def _top_k_max() -> int:
+    return max(_cfg_int("TOP_K_MAX", 10), _top_k_min())
+
+
+def _top_k_default() -> int:
+    raw = getattr(config, "TOP_K_DEFAULT", None)
+    if raw is None:
+        raw = _cfg_int("TOP_K", 4)
+    return min(max(int(raw), _top_k_min()), _top_k_max())
+
+
+def _clamp_top_k(value) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = _top_k_default()
+    return min(max(value, _top_k_min()), _top_k_max())
+
+
+def _search_max_results() -> int:
+    return max(1, _cfg_int("SEARCH_MAX_RESULTS", 20))
+
+
+def _search_default_results() -> int:
+    return min(max(1, _cfg_int("SEARCH_DEFAULT_RESULTS", 8)), _search_max_results())
+
+
+def _max_files_per_session() -> int:
+    return max(1, _cfg_int("MAX_FILES_PER_SESSION", 5))
+
+
+# --- Defensive service accessors ------------------------------------------
+def _is_valid_id(value) -> bool:
+    fn = getattr(security, "is_valid_id", None)
+    if fn is not None:
+        try:
+            return bool(fn(value))
+        except Exception:  # noqa: BLE001
+            pass
+    return bool(isinstance(value, str) and _HEX32.match(value))
+
+
+def _current_document(session_id: str):
+    fn = getattr(session_service, "current_document", None)
+    if fn is None:
+        return None
+    try:
+        return fn(session_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _list_documents(session_id: str) -> list:
+    fn = getattr(session_service, "list_documents", None)
+    if fn is not None:
+        try:
+            return list(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    doc = _current_document(session_id)
+    return [doc] if doc is not None else []
+
+
+def _ready_documents(session_id: str) -> list:
+    fn = getattr(session_service, "ready_documents", None)
+    if fn is not None:
+        try:
+            return list(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return [d for d in _list_documents(session_id) if getattr(d, "status", "") == "ready"]
+
+
+def _live_document_count(session_id: str) -> int:
+    fn = getattr(session_service, "live_document_count", None)
+    if fn is not None:
+        try:
+            return int(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return len(_list_documents(session_id))
+
+
+def _has_document_slot(session_id: str) -> bool:
+    fn = getattr(session_service, "has_document_slot", None)
+    if fn is not None:
+        try:
+            return bool(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return _live_document_count(session_id) < _max_files_per_session()
+
+
+def _session_stats(session_id: str) -> dict:
+    fn = getattr(session_service, "stats", None)
+    if fn is not None:
+        try:
+            return dict(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    ready = _ready_documents(session_id)
+    return {
+        "num_documents": len(ready),
+        "total_pages": sum(getattr(d, "num_pages", 0) for d in ready),
+        "total_chunks": sum(getattr(d, "num_chunks", 0) for d in ready),
+    }
+
+
+def _remaining_questions(session_id: str) -> int:
+    fn = getattr(session_service, "remaining_questions", None)
+    if fn is None:
+        return 0
+    try:
+        return int(fn(session_id))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _delete_document(session_id: str, document_id: str) -> None:
+    fn = getattr(document_service, "delete_document", None)
+    if fn is not None:
+        fn(session_id, document_id)
+        return
+    fn = getattr(document_service, "delete_current", None)
+    if fn is not None:
+        fn(session_id)
+        return
+    raise RuntimeError("no delete API available")
+
+
+def _retrieve(session_id: str, document_ids, query: str, top_k: int) -> list[dict]:
+    """Retrieve across documents, tolerating single-doc and multi-doc APIs."""
+    ids = [d for d in (document_ids or []) if d != ALL_DOCS and _is_valid_id(d)]
+    if not ids:
+        return []
+
+    fn = getattr(retrieval_service, "retrieve", None)
+    if fn is None:
+        return []
+
+    # Preferred: multi-document API (accepts a list of ids).
+    try:
+        return list(fn(session_id, ids, query, top_k=top_k) or [])
+    except Exception:  # noqa: BLE001 - older builds reject a list outright
+        pass
+
+    # Fallback: legacy single-document API — query each, then merge by score.
+    merged: list[dict] = []
+    for doc_id in ids:
+        try:
+            merged.extend(fn(session_id, doc_id, query, top_k=top_k) or [])
+        except Exception:  # noqa: BLE001
+            continue
+    merged.sort(key=lambda r: r.get("score", 0), reverse=True)
+    return merged[:top_k]
+
+
+# --- Defensive UI helpers -------------------------------------------------
+def _ui(name: str):
+    return getattr(components, name, None)
+
+
+def _render_dashboard(session_id: str) -> None:
+    stats = _session_stats(session_id)
+    remaining = _remaining_questions(session_id)
+
+    fn = _ui("dashboard")
+    if fn is not None:
+        try:
+            fn(stats, remaining)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+
+    fn = _ui("session_dashboard")
+    if fn is not None:
+        try:
+            fn(_current_document(session_id))
+            return
+        except Exception:  # noqa: BLE001
+            pass
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("عدد المستندات", stats.get("num_documents", 0))
+    c2.metric("إجمالي الصفحات", stats.get("total_pages", 0))
+    c3.metric("إجمالي المقاطع", stats.get("total_chunks", 0))
+    c4.metric("الأسئلة المتبقية", remaining)
+
+
+def _render_document_card(doc) -> None:
+    fn = _ui("document_card")
+    if fn is not None:
+        try:
+            fn(doc)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    st.markdown(
+        f"**{doc.display_name}** — {getattr(doc, 'num_pages', 0)} صفحة · "
+        f"{getattr(doc, 'num_chunks', 0)} مقطع · {getattr(doc, 'status', '')}"
+    )
+
+
+def _render_source(result: dict, limit: int = 400) -> None:
+    fn = _ui("source_card")
+    if fn is not None:
+        try:
+            fn(result)
+        except Exception:  # noqa: BLE001
+            st.markdown(f"**{result.get('document_name', 'مستند')}**")
+    fn = _ui("excerpt")
+    if fn is not None:
+        try:
+            fn(result.get("text", ""), limit=limit)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    st.text((result.get("text") or "")[:limit])
+
+
+def _page_header(title: str, subtitle: str = "") -> None:
+    fn = _ui("page_header")
+    if fn is not None:
+        try:
+            fn(title, subtitle)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    st.subheader(title)
+    if subtitle:
+        st.caption(subtitle)
+
+
+# --- State ----------------------------------------------------------------
 def _init_state() -> None:
     if "session_id" not in st.session_state:
         st.session_state["session_id"] = security.new_id()
         log_event("session_start", st.session_state["session_id"], status="new")
     st.session_state.setdefault("page", "documents")
     st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("top_k", app_config.top_k_default())
+    st.session_state.setdefault("top_k", _top_k_default())
     st.session_state.setdefault("confirm_delete", None)
     session_service.get_or_create(st.session_state["session_id"])
 
@@ -65,7 +322,13 @@ def _sid() -> str:
 # --- Sidebar --------------------------------------------------------------
 def _sidebar() -> None:
     with st.sidebar:
-        components.brand_sidebar()
+        fn = _ui("brand_sidebar")
+        if fn is not None:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                st.markdown("### المدقق الشامل")
+
         st.markdown("---")
         active = st.session_state["page"]
         for key, label in NAV:
@@ -78,20 +341,25 @@ def _sidebar() -> None:
 
         st.markdown("---")
         with st.expander("إعدادات الاسترجاع"):
-            # Clamp any pre-existing value into the valid range before the
-            # slider renders (guards against env/config changes across reruns).
-            current = st.session_state.get("top_k", app_config.top_k_default())
-            st.session_state["top_k"] = app_config.clamp_top_k(current)
+            # Clamp before the slider renders so an out-of-range stored value
+            # can never make Streamlit raise.
+            st.session_state["top_k"] = _clamp_top_k(
+                st.session_state.get("top_k", _top_k_default())
+            )
             st.slider(
                 "عدد المقاطع المسترجعة لكل سؤال (Top-K)",
-                min_value=app_config.top_k_min(),
-                max_value=app_config.top_k_max(),
+                min_value=_top_k_min(),
+                max_value=_top_k_max(),
                 key="top_k",
             )
 
-        remaining = session_service.remaining_questions(_sid())
-        st.caption(f"الأسئلة المتبقية في الجلسة: {remaining}")
-        components.sidebar_privacy()
+        st.caption(f"الأسئلة المتبقية في الجلسة: {_remaining_questions(_sid())}")
+        fn = _ui("sidebar_privacy")
+        if fn is not None:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # --- Document selector (shared by chat + search) --------------------------
@@ -117,22 +385,21 @@ def _document_selector(ready_docs: list, key: str) -> list[str]:
 
 # --- Pages ----------------------------------------------------------------
 def page_documents() -> None:
-    components.page_header(
-        "المستندات", "أضف مستنداتك وأدرها مؤقتاً ضمن جلستك التجريبية."
-    )
+    _page_header("المستندات", "أضف مستنداتك وأدرها مؤقتاً ضمن جلستك التجريبية.")
 
-    live = compat.live_document_count(_sid())
-    can_add = live < app_config.max_files_per_session()
+    live = _live_document_count(_sid())
+    max_files = _max_files_per_session()
+    can_add = live < max_files
 
     with st.expander("＋ إضافة مستند جديد", expanded=(live == 0)):
         if not can_add:
             st.info(
-                f"تم الوصول إلى الحد الأقصى ({app_config.max_files_per_session()} مستندات). "
+                f"تم الوصول إلى الحد الأقصى ({max_files} مستندات). "
                 "احذف مستنداً لإضافة آخر."
             )
         st.caption(
-            f"PDF فقط · بحد أقصى {config.MAX_FILE_SIZE_MB} ميغابايت و"
-            f"{config.MAX_PAGES} صفحة لكل ملف."
+            f"PDF فقط · بحد أقصى {_cfg_int('MAX_FILE_SIZE_MB', 10)} ميغابايت و"
+            f"{_cfg_int('MAX_PAGES', 50)} صفحة لكل ملف."
         )
         uploaded = st.file_uploader(
             "اختر ملف PDF (يمكن اختيار أكثر من ملف)",
@@ -144,19 +411,19 @@ def page_documents() -> None:
         if uploaded and st.button("رفع وفهرسة", type="primary", disabled=not can_add):
             _ingest_uploads(uploaded)
 
-    docs = compat.list_documents(_sid())
+    docs = _list_documents(_sid())
     if not docs:
         st.info("لا توجد مستندات بعد. أضف مستنداً للبدء.")
         return
 
     st.markdown("### مستنداتك")
     for doc in docs:
-        compat.render_document_card(doc)
+        _render_document_card(doc)
         if st.session_state.get("confirm_delete") == doc.document_id:
             st.warning(f"هل أنت متأكد من حذف: {doc.display_name}؟ لا يمكن التراجع.")
             c1, c2 = st.columns(2)
             if c1.button("نعم، احذف", key=f"yes_{doc.document_id}", type="primary"):
-                compat.delete_document(_sid(), doc.document_id)
+                _delete_document(_sid(), doc.document_id)
                 st.session_state["confirm_delete"] = None
                 st.success("تم حذف المستند.")
                 st.rerun()
@@ -175,11 +442,11 @@ def page_documents() -> None:
 
 
 def _ingest_uploads(uploaded) -> None:
-    added, skipped = 0, 0
+    added = 0
     for uf in uploaded:
-        if not session_service.has_document_slot(_sid()):
+        if not _has_document_slot(_sid()):
             st.warning(
-                f"تم بلوغ الحد الأقصى ({app_config.max_files_per_session()}). "
+                f"تم بلوغ الحد الأقصى ({_max_files_per_session()}). "
                 "لم تتم إضافة باقي الملفات."
             )
             break
@@ -188,11 +455,9 @@ def _ingest_uploads(uploaded) -> None:
                 result = document_service.ingest(_sid(), uf.getvalue(), uf.name)
             except security.UploadRejected as exc:
                 st.error(f"{uf.name}: {exc}")
-                skipped += 1
                 continue
             except Exception:  # noqa: BLE001 - never leak internals
                 st.error(f"{uf.name}: حدث خطأ غير متوقع أثناء المعالجة.")
-                skipped += 1
                 continue
         st.success(
             f"تم تجهيز المستند: {result.display_name} "
@@ -209,10 +474,8 @@ def _no_documents_notice() -> None:
 
 
 def page_search() -> None:
-    components.page_header(
-        "البحث", "بحث دلالي مباشر داخل مستنداتك — بدون نموذج ذكاء اصطناعي خارجي."
-    )
-    ready = compat.ready_documents(_sid())
+    _page_header("البحث", "بحث دلالي مباشر داخل مستنداتك — بدون نموذج ذكاء اصطناعي خارجي.")
+    ready = _ready_documents(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -224,8 +487,8 @@ def page_search() -> None:
     n_results = col_n.number_input(
         "عدد النتائج",
         min_value=1,
-        max_value=app_config.search_max_results(),
-        value=app_config.search_default_results(),
+        max_value=_search_max_results(),
+        value=_search_default_results(),
         step=1,
         key="search_n",
     )
@@ -237,24 +500,19 @@ def page_search() -> None:
         return
 
     with st.spinner("جاري البحث..."):
-        results = compat.retrieve(
-            _sid(), resolved, query.strip(), top_k=int(n_results)
-        )
+        results = _retrieve(_sid(), resolved, query.strip(), top_k=int(n_results))
     if not results:
         st.warning("لا توجد نتائج مطابقة.")
         return
 
     st.caption(f"عدد النتائج: {len(results)}")
     for r in results:
-        components.source_card(r)
-        components.excerpt(r.get("text", ""), limit=500)
+        _render_source(r, limit=500)
 
 
 def page_chat() -> None:
-    components.page_header(
-        "المحادثة", "اسأل عن محتوى مستنداتك واحصل على إجابة بمصادرها."
-    )
-    ready = compat.ready_documents(_sid())
+    _page_header("المحادثة", "اسأل عن محتوى مستنداتك واحصل على إجابة بمصادرها.")
+    ready = _ready_documents(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -266,7 +524,8 @@ def page_chat() -> None:
         st.session_state["messages"] = []
         st.rerun()
 
-    if not config.groq_is_configured():
+    configured = bool(getattr(config, "groq_is_configured", lambda: False)())
+    if not configured:
         st.warning(
             "المحادثة غير مُهيأة حالياً في هذه النسخة التجريبية. "
             "يمكنك استخدام **البحث** الذي يعمل محلياً على الخادم."
@@ -274,12 +533,13 @@ def page_chat() -> None:
 
     _render_history()
 
-    remaining = session_service.remaining_questions(_sid())
+    remaining = _remaining_questions(_sid())
     if remaining <= 0:
         st.error("تم الوصول إلى حد عدد الأسئلة في هذه الجلسة التجريبية.")
 
-    disabled = remaining <= 0 or not config.groq_is_configured()
-    question = st.chat_input("اكتب سؤالك هنا...", disabled=disabled)
+    question = st.chat_input(
+        "اكتب سؤالك هنا...", disabled=(remaining <= 0 or not configured)
+    )
     if not question:
         return
 
@@ -287,15 +547,15 @@ def page_chat() -> None:
         st.warning("يرجى اختيار مستند واحد على الأقل قبل إرسال السؤال.")
         return
 
-    question = question.strip()[: config.MAX_QUESTION_CHARS]
+    question = question.strip()[: _cfg_int("MAX_QUESTION_CHARS", 2000)]
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
         with st.spinner("جاري البحث في المستندات..."):
-            results = compat.retrieve(
-                _sid(), resolved, question, top_k=st.session_state["top_k"]
+            results = _retrieve(
+                _sid(), resolved, question, top_k=_clamp_top_k(st.session_state["top_k"])
             )
         if not results:
             answer_text = "لم أجد في المستندات المحددة معلومات كافية للإجابة."
@@ -307,14 +567,16 @@ def page_chat() -> None:
 
         session_service.record_question(_sid())
         with st.spinner("جاري توليد الإجابة..."):
-            result = llm_service.answer(_sid(), question, results)
+            try:
+                result = llm_service.answer(_sid(), question, results)
+                answer_text = result.user_message
+            except Exception:  # noqa: BLE001 - never leak internals
+                answer_text = "تعذّر إنتاج الإجابة حالياً. يرجى المحاولة مرة أخرى."
 
-        answer_text = result.user_message
         st.markdown(answer_text)
         with st.expander("عرض المقاطع المستخدمة"):
             for s in results:
-                components.source_card(s)
-                components.excerpt(s.get("text", ""))
+                _render_source(s)
 
     st.session_state["messages"].append(
         {"role": "assistant", "content": answer_text, "sources": results}
@@ -328,13 +590,17 @@ def _render_history() -> None:
             if msg.get("sources"):
                 with st.expander("عرض المقاطع المستخدمة"):
                     for s in msg["sources"]:
-                        components.source_card(s)
-                        components.excerpt(s.get("text", ""))
+                        _render_source(s)
 
 
 def page_about() -> None:
-    components.hero()
-    components.page_header("حول النسخة التجريبية", "ماذا تُرسل ولماذا.")
+    fn = _ui("hero")
+    if fn is not None:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            pass
+    _page_header("حول النسخة التجريبية", "ماذا تُرسل ولماذا.")
     st.markdown(
         f"""
 ### النسخة التجريبية مقابل النسخة المكتبية
@@ -355,11 +621,11 @@ def page_about() -> None:
 
 ### الحدود الحالية للنسخة التجريبية
 
-- الحجم الأقصى للملف: {config.MAX_FILE_SIZE_MB} ميغابايت.
-- الحد الأقصى للصفحات: {config.MAX_PAGES} صفحة لكل ملف.
-- عدد المستندات في الجلسة: {app_config.max_files_per_session()}.
-- الحد الأقصى للأسئلة في الجلسة: {config.MAX_QUESTIONS_PER_SESSION}.
-- مدة الجلسة قبل الحذف التلقائي: {config.SESSION_TTL_MINUTES} دقيقة.
+- الحجم الأقصى للملف: {_cfg_int('MAX_FILE_SIZE_MB', 10)} ميغابايت.
+- الحد الأقصى للصفحات: {_cfg_int('MAX_PAGES', 50)} صفحة لكل ملف.
+- عدد المستندات في الجلسة: {_max_files_per_session()}.
+- الحد الأقصى للأسئلة في الجلسة: {_cfg_int('MAX_QUESTIONS_PER_SESSION', 20)}.
+- مدة الجلسة قبل الحذف التلقائي: {_cfg_int('SESSION_TTL_MINUTES', 30)} دقيقة.
 
 ### مزوّد النموذج
 
@@ -368,7 +634,7 @@ def page_about() -> None:
 للمستندات الحساسة.
         """
     )
-    st.caption(f"الإصدار: {config.DEMO_VERSION}")
+    st.caption(f"الإصدار: {getattr(config, 'DEMO_VERSION', '')}")
 
 
 PAGES = {
@@ -380,17 +646,28 @@ PAGES = {
 
 
 def main() -> None:
-    styles.inject()
-    config.ensure_storage_root()
-    cleanup_service.start_background_sweeper()
-    cleanup_service.sweep()  # opportunistic, throttled
+    try:
+        styles.inject()
+    except Exception:  # noqa: BLE001
+        pass
+
+    fn = getattr(config, "ensure_storage_root", None)
+    if fn is not None:
+        fn()
+
+    try:
+        cleanup_service.start_background_sweeper()
+        cleanup_service.sweep()  # opportunistic, throttled
+    except Exception:  # noqa: BLE001
+        pass
+
     _init_state()
     _sidebar()
     session_service.touch(_sid())
 
     page = st.session_state["page"]
     if page != "about":
-        compat.render_dashboard(_sid())
+        _render_dashboard(_sid())
     PAGES.get(page, page_documents)()
 
 
