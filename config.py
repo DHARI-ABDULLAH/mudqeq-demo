@@ -86,10 +86,14 @@ MAX_UPLOADS_PER_SESSION = _int_env(
 SESSION_TTL_MINUTES = _int_env("SESSION_TTL_MINUTES", 30, minimum=1, maximum=1440)
 
 # --- RAG / retrieval ------------------------------------------------------
-TOP_K = _int_env("TOP_K", 4, minimum=1, maximum=10)
 # Bounds for the chat Top-K control (mirrors the desktop settings slider).
 TOP_K_MIN = _int_env("TOP_K_MIN", 2, minimum=1, maximum=10)
 TOP_K_MAX = _int_env("TOP_K_MAX", 10, minimum=TOP_K_MIN, maximum=20)
+# Canonical Top-K used as the retrieval default across services and the UI.
+TOP_K = _int_env("TOP_K", 4, minimum=1, maximum=10)
+# Slider-safe default: always guaranteed to fall within [TOP_K_MIN, TOP_K_MAX]
+# so the Streamlit slider can never receive an out-of-range initial value.
+TOP_K_DEFAULT = min(max(TOP_K, TOP_K_MIN), TOP_K_MAX)
 # Search page has its own results control (independent of chat Top-K).
 SEARCH_DEFAULT_RESULTS = _int_env("SEARCH_DEFAULT_RESULTS", 8, minimum=1, maximum=50)
 SEARCH_MAX_RESULTS = _int_env("SEARCH_MAX_RESULTS", 20, minimum=1, maximum=100)

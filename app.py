@@ -52,7 +52,7 @@ def _init_state() -> None:
         log_event("session_start", st.session_state["session_id"], status="new")
     st.session_state.setdefault("page", "documents")
     st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("top_k", config.TOP_K)
+    st.session_state.setdefault("top_k", config.TOP_K_DEFAULT)
     st.session_state.setdefault("confirm_delete", None)
     session_service.get_or_create(st.session_state["session_id"])
 
@@ -77,6 +77,12 @@ def _sidebar() -> None:
 
         st.markdown("---")
         with st.expander("إعدادات الاسترجاع"):
+            # Clamp any pre-existing value into the valid range before the
+            # slider renders (guards against env/config changes across reruns).
+            current = st.session_state.get("top_k", config.TOP_K_DEFAULT)
+            st.session_state["top_k"] = min(
+                max(int(current), config.TOP_K_MIN), config.TOP_K_MAX
+            )
             st.slider(
                 "عدد المقاطع المسترجعة لكل سؤال (Top-K)",
                 min_value=config.TOP_K_MIN,
