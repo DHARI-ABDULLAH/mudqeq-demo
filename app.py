@@ -18,6 +18,7 @@ from __future__ import annotations
 import streamlit as st
 
 import config
+import app_config
 from core.logging_utils import log_event
 from services import (
     cleanup_service,
@@ -52,7 +53,7 @@ def _init_state() -> None:
         log_event("session_start", st.session_state["session_id"], status="new")
     st.session_state.setdefault("page", "documents")
     st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("top_k", config.TOP_K_DEFAULT)
+    st.session_state.setdefault("top_k", app_config.top_k_default())
     st.session_state.setdefault("confirm_delete", None)
     session_service.get_or_create(st.session_state["session_id"])
 
@@ -79,14 +80,12 @@ def _sidebar() -> None:
         with st.expander("إعدادات الاسترجاع"):
             # Clamp any pre-existing value into the valid range before the
             # slider renders (guards against env/config changes across reruns).
-            current = st.session_state.get("top_k", config.TOP_K_DEFAULT)
-            st.session_state["top_k"] = min(
-                max(int(current), config.TOP_K_MIN), config.TOP_K_MAX
-            )
+            current = st.session_state.get("top_k", app_config.top_k_default())
+            st.session_state["top_k"] = app_config.clamp_top_k(current)
             st.slider(
                 "عدد المقاطع المسترجعة لكل سؤال (Top-K)",
-                min_value=config.TOP_K_MIN,
-                max_value=config.TOP_K_MAX,
+                min_value=app_config.top_k_min(),
+                max_value=app_config.top_k_max(),
                 key="top_k",
             )
 
@@ -123,12 +122,12 @@ def page_documents() -> None:
     )
 
     live = session_service.live_document_count(_sid())
-    can_add = live < config.MAX_FILES_PER_SESSION
+    can_add = live < app_config.max_files_per_session()
 
     with st.expander("＋ إضافة مستند جديد", expanded=(live == 0)):
         if not can_add:
             st.info(
-                f"تم الوصول إلى الحد الأقصى ({config.MAX_FILES_PER_SESSION} مستندات). "
+                f"تم الوصول إلى الحد الأقصى ({app_config.max_files_per_session()} مستندات). "
                 "احذف مستنداً لإضافة آخر."
             )
         st.caption(
@@ -180,7 +179,7 @@ def _ingest_uploads(uploaded) -> None:
     for uf in uploaded:
         if not session_service.has_document_slot(_sid()):
             st.warning(
-                f"تم بلوغ الحد الأقصى ({config.MAX_FILES_PER_SESSION}). "
+                f"تم بلوغ الحد الأقصى ({app_config.max_files_per_session()}). "
                 "لم تتم إضافة باقي الملفات."
             )
             break
@@ -225,8 +224,8 @@ def page_search() -> None:
     n_results = col_n.number_input(
         "عدد النتائج",
         min_value=1,
-        max_value=config.SEARCH_MAX_RESULTS,
-        value=config.SEARCH_DEFAULT_RESULTS,
+        max_value=app_config.search_max_results(),
+        value=app_config.search_default_results(),
         step=1,
         key="search_n",
     )
@@ -358,7 +357,7 @@ def page_about() -> None:
 
 - الحجم الأقصى للملف: {config.MAX_FILE_SIZE_MB} ميغابايت.
 - الحد الأقصى للصفحات: {config.MAX_PAGES} صفحة لكل ملف.
-- عدد المستندات في الجلسة: {config.MAX_FILES_PER_SESSION}.
+- عدد المستندات في الجلسة: {app_config.max_files_per_session()}.
 - الحد الأقصى للأسئلة في الجلسة: {config.MAX_QUESTIONS_PER_SESSION}.
 - مدة الجلسة قبل الحذف التلقائي: {config.SESSION_TTL_MINUTES} دقيقة.
 
