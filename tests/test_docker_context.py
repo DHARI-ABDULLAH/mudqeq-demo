@@ -62,6 +62,19 @@ def test_requirements_are_demo_scoped():
         assert any(needed in ln for ln in lines), f"missing demo dependency: {needed}"
 
 
+def test_streamlit_config_no_forced_port():
+    """Streamlit Community Cloud health-checks 127.0.0.1:8501 — never hardcode 7860."""
+    cfg = (WEB_DEMO / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+    for line in cfg.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            continue
+        assert "port = 7860" not in stripped, "config.toml must not force port 7860"
+        assert 'address = "0.0.0.0"' not in stripped, (
+            "config.toml must not force bind address for Streamlit Cloud"
+        )
+
+
 def test_no_ollama_dependency():
     """Web demo must not depend on Ollama or desktop stack."""
     lines = _requirement_lines()

@@ -164,13 +164,18 @@ cp .env.example .env
 # Option B — shell export (no .env file):
 # export GROQ_API_KEY=your_key_here
 
-streamlit run app.py --server.port 7860 --server.address 127.0.0.1
+streamlit run app.py
 ```
 
 **Chat** requires `GROQ_API_KEY`. **Search** works without it. The key is read
 only by Python on the server — never sent to the browser.
 
-Open http://localhost:7860
+Open http://localhost:8501 (Streamlit default port).
+
+> Streamlit 1.6x uses Uvicorn internally — seeing `Uvicorn server started` in
+> logs is **normal** and does **not** mean a separate FastAPI backend is running.
+> Do **not** set `server.port = 7860` in `.streamlit/config.toml`; that breaks
+> Streamlit Community Cloud health checks on port 8501.
 
 ### Run tests
 

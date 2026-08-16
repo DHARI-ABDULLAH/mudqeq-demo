@@ -1,12 +1,15 @@
 # web_demo/.streamlit/config.toml
-# Streamlit configuration for the PUBLIC demo running on Hugging Face
-# Docker Spaces.
+# Streamlit configuration for the PUBLIC demo.
+#
+# IMPORTANT: do NOT hardcode server.address / server.port here.
+# Streamlit Community Cloud runs the app on its own default port (8501) and
+# health-checks 127.0.0.1:8501. Forcing a port (e.g. 7860) makes the app bind
+# the wrong port and the platform health check fails ("connection refused").
+# For Docker/HF the port is set via CLI flags in the Dockerfile CMD instead.
+# For local runs: streamlit run app.py  (default port 8501)
 
 [server]
 headless = true
-# HF Docker Spaces expose a single port; Streamlit must bind 0.0.0.0:7860.
-address = "0.0.0.0"
-port = 7860
 # Disable the local-source file watcher (also avoids noisy transformers
 # introspection tracebacks on startup).
 fileWatcherType = "none"
