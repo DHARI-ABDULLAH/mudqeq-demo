@@ -8,7 +8,7 @@ the desktop app's UX (multi-document management, selection, search, chat):
 
     upload (validated, temporary, per-session, MANY docs)
       -> extract -> chunk -> embed -> FAISS (per document)
-      -> select documents -> search (local) / chat (Groq hosted LLM)
+      -> select documents -> search (local) / chat (OpenAI hosted LLM)
 
 Resilience note
 ---------------
@@ -388,7 +388,42 @@ def _capabilities() -> dict[str, bool]:
         ),
         "core.intent": _intent is not None,
         "services.chat_service": chat_service is not None,
+        "chat_service.provider_error_kind": hasattr(
+            chat_service, "KIND_PROVIDER_ERROR"
+        ),
+        "config.openai_is_configured": hasattr(config, "openai_is_configured"),
+        "llm_service(OpenAI)": getattr(llm_service, "PROVIDER_NAME", "") == "OpenAI",
         "components.dashboard": hasattr(components, "dashboard"),
+    }
+
+
+def _llm_is_configured() -> bool:
+    """True when the hosted provider has a key available on the server."""
+    fn = getattr(config, "openai_is_configured", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception as exc:  # noqa: BLE001
+        _note_failure("openai_is_configured", exc)
+        return False
+
+
+def _llm_diagnostics() -> dict:
+    """Provider status for the technical panel. NEVER includes the API key."""
+    getter = getattr(config, "get_openai_model", None)
+    try:
+        model = getter() if getter else ""
+    except Exception as exc:  # noqa: BLE001
+        _note_failure("get_openai_model", exc)
+        model = ""
+    return {
+        "LLM provider": getattr(config, "LLM_PROVIDER", "OpenAI"),
+        "Model": model or getattr(config, "DEFAULT_OPENAI_MODEL", "غير معروف"),
+        "API configured": "yes" if _llm_is_configured() else "no",
+        "Max output tokens": getattr(config, "OPENAI_MAX_OUTPUT_TOKENS", None),
+        "Max RAG context chars": _cfg_int("MAX_RAG_CONTEXT_CHARS", 6000),
+        "Retries (transient faults only)": getattr(config, "OPENAI_MAX_RETRIES", None),
     }
 
 
@@ -694,7 +729,7 @@ def page_chat() -> None:
         st.session_state["messages"] = []
         st.rerun()
 
-    configured = bool(getattr(config, "groq_is_configured", lambda: False)())
+    configured = _llm_is_configured()
     if not configured:
         st.warning(
             "المحادثة غير مُهيأة حالياً في هذه النسخة التجريبية. "
@@ -737,7 +772,7 @@ def page_chat() -> None:
         answer_text = outcome["text"]
         results = outcome["sources"]
 
-        if outcome["kind"] == "index_error":
+        if outcome["kind"] in ("index_error", "provider_error"):
             st.error(answer_text)
         else:
             st.markdown(answer_text)
@@ -798,14 +833,31 @@ def _chat_turn(question: str, resolved: list[str]) -> dict:
             "diagnostics": st.session_state.get("last_retrieval", {}),
         }
 
-    session_service.record_question(_sid())
     try:
-        text = _llm_answer(_sid(), question, results, mode).user_message
-    except Exception:  # noqa: BLE001 - never leak internals
-        text = "تعذّر إنتاج الإجابة حالياً. يرجى المحاولة مرة أخرى."
+        result = _llm_answer(_sid(), question, results, mode)
+    except Exception as exc:  # noqa: BLE001 - never leak internals
+        _note_failure("llm_service", exc)
+        return {
+            "kind": "provider_error",
+            "text": "تعذّر إنتاج الإجابة حالياً. يرجى المحاولة مرة أخرى. "
+            "لم يُستهلك أي سؤال من رصيدك.",
+            "sources": results,
+            "diagnostics": st.session_state.get("last_retrieval", {}),
+        }
+
+    if not getattr(result, "ok", False):
+        return {
+            "kind": "provider_error",
+            "text": result.user_message,
+            "sources": results,
+            "diagnostics": st.session_state.get("last_retrieval", {}),
+        }
+
+    # Quota is spent only once the provider actually returned an answer.
+    session_service.record_question(_sid())
     return {
         "kind": "answer",
-        "text": text,
+        "text": result.text,
         "sources": results,
         "diagnostics": st.session_state.get("last_retrieval", {}),
     }
@@ -857,14 +909,18 @@ def page_about() -> None:
 
 ### مزوّد النموذج
 
-يستخدم هذا العرض نموذجاً مستضافاً عبر واجهة برمجية. سياسات الاحتفاظ بالبيانات
-تخضع لإعدادات حساب المزوّد المُستخدَم في النشر؛ لا تُستخدم النسخة التجريبية
-للمستندات الحساسة.
+تتم صياغة الإجابات عبر واجهة **OpenAI** البرمجية. لا يُرفع ملف PDF كاملاً إلى
+المزوّد؛ يُرسَل فقط سؤالك مع مقاطع نصية محدودة الحجم مستخرجة من المستندات التي
+اخترتها. الاستخراج والتقطيع والتمثيل المتجهي والبحث (FAISS) تتم كلها محلياً على
+خادم النسخة التجريبية. لا تُستخدم النسخة التجريبية للمستندات الحساسة.
         """
     )
     st.caption(f"الإصدار: {getattr(config, 'DEMO_VERSION', '')}")
 
     with st.expander("معلومات تقنية"):
+        st.caption("مزوّد النموذج اللغوي:")
+        st.json(_llm_diagnostics())
+
         caps = _capabilities()
         st.caption("الوحدات المُحمّلة على الخادم:")
         for name, ok in caps.items():

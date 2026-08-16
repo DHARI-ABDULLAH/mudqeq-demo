@@ -92,7 +92,7 @@ def test_app_survives_stale_config(monkeypatch):
         "MAX_QUESTION_CHARS",
         "MAX_QUESTIONS_PER_SESSION",
         "SESSION_TTL_MINUTES",
-        "groq_is_configured",
+        "openai_is_configured",
         "ensure_storage_root",
     ]:
         setattr(stale, name, getattr(real, name))

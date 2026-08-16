@@ -1,64 +1,118 @@
 """
 web_demo/services/llm_service.py
 --------------------------------
-Web-demo-only hosted LLM adapter (Groq, OpenAI-compatible endpoint).
+Web-demo-only hosted LLM adapter (OpenAI, Responses API).
 
 This adapter is completely separate from the desktop Ollama client. The
 desktop product is untouched and keeps using local Ollama.
 
 Security / privacy:
-- The API key is read from the environment (HF Space secret) and is NEVER
+- The API key is read from the environment / Streamlit secret and is NEVER
   logged, echoed, or returned to the browser.
 - Only the user's question + a *bounded* set of retrieved chunks are sent.
   The full PDF is never transmitted.
 - Retrieved document text is framed as UNTRUSTED DATA. The system prompt
   instructs the model to ignore any instructions embedded in the document.
+- Responses are not persisted on the provider side (``store=False``).
 - Public users never see stack traces; failures map to Arabic categories.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 
-import requests
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from config import (
-    GROQ_BASE_URL,
-    GROQ_CONNECT_TIMEOUT,
-    GROQ_MAX_OUTPUT_TOKENS,
-    GROQ_MAX_RETRIES,
-    GROQ_READ_TIMEOUT,
-    GROQ_TEMPERATURE,
     MAX_RAG_CONTEXT_CHARS,
-    get_groq_api_key,
-    get_groq_model,
-    groq_is_configured,
+    OPENAI_BASE_URL,
+    OPENAI_MAX_OUTPUT_TOKENS,
+    OPENAI_MAX_RETRIES,
+    OPENAI_TEMPERATURE,
+    OPENAI_TIMEOUT_SECONDS,
+    get_openai_api_key,
+    get_openai_model,
+    openai_is_configured,
 )
 from core.logging_utils import log_event
+
+PROVIDER_NAME = "OpenAI"
 
 # Error categories (never leak internals to the user).
 ERR_NOT_CONFIGURED = "not_configured"
 ERR_AUTH = "auth"
 ERR_RATE_LIMIT = "rate_limit"
+ERR_BAD_REQUEST = "bad_request"
+ERR_CONTEXT_TOO_LARGE = "context_too_large"
+ERR_MODEL = "model_not_found"
 ERR_UPSTREAM = "upstream"
 ERR_TIMEOUT = "timeout"
 ERR_NETWORK = "network"
 ERR_EMPTY = "empty"
 
+# Arabic, user-facing. A provider limit is deliberately NOT described as
+# "حد النسخة التجريبية" — that phrase belongs to the session question quota.
 _ARABIC_MESSAGES = {
-    ERR_NOT_CONFIGURED: "خدمة الذكاء الاصطناعي غير مُهيأة حالياً في النسخة التجريبية.",
-    ERR_AUTH: (
-        "تعذّر التحقق من صلاحية الوصول إلى خدمة الذكاء الاصطناعي "
-        "(مشكلة في مفتاح الخدمة، وليست مشكلة في مستندك). "
-        "يرجى إبلاغ مشغّل النسخة التجريبية."
+    ERR_NOT_CONFIGURED: (
+        "خدمة الذكاء الاصطناعي غير مُهيأة حالياً في النسخة التجريبية. "
+        "لم يُستهلك أي سؤال من رصيدك."
     ),
-    ERR_RATE_LIMIT: "تم الوصول مؤقتاً إلى حد استخدام النسخة التجريبية. يرجى المحاولة لاحقاً.",
-    ERR_UPSTREAM: "خدمة الذكاء الاصطناعي غير متاحة مؤقتاً. يرجى المحاولة لاحقاً.",
-    ERR_TIMEOUT: "استغرقت الخدمة وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى.",
-    ERR_NETWORK: "تعذّر الاتصال بخدمة الذكاء الاصطناعي. يرجى المحاولة لاحقاً.",
-    ERR_EMPTY: "لم يتم إنتاج إجابة. يرجى إعادة صياغة السؤال والمحاولة مرة أخرى.",
+    ERR_AUTH: (
+        "تعذّر التحقق من صلاحية الوصول إلى مزوّد الذكاء الاصطناعي "
+        "(مشكلة في إعداد مفتاح الخدمة، وليست مشكلة في مستندك). "
+        "يرجى إبلاغ مشغّل النسخة التجريبية. لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_RATE_LIMIT: (
+        "مزوّد الذكاء الاصطناعي مشغول أو تم تجاوز حد الاستخدام لديه حالياً. "
+        "هذا ليس حد أسئلتك في الجلسة. يرجى المحاولة بعد قليل — "
+        "لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_BAD_REQUEST: (
+        "تعذّر تنفيذ الطلب بصيغته الحالية. يرجى إعادة صياغة السؤال والمحاولة "
+        "مرة أخرى. لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_CONTEXT_TOO_LARGE: (
+        "حجم النص المُرسل من المستند أكبر من الحد المسموح به. "
+        "يرجى تحديد عدد أقل من المستندات أو طرح سؤال أكثر تحديداً. "
+        "لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_MODEL: (
+        "النموذج المُهيأ غير متاح لدى المزوّد حالياً. "
+        "يرجى إبلاغ مشغّل النسخة التجريبية. لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_UPSTREAM: (
+        "خدمة الذكاء الاصطناعي غير متاحة مؤقتاً لدى المزوّد. يرجى المحاولة "
+        "لاحقاً. لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_TIMEOUT: (
+        "استغرقت الخدمة وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى. "
+        "لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_NETWORK: (
+        "تعذّر الاتصال بمزوّد الذكاء الاصطناعي. يرجى المحاولة لاحقاً. "
+        "لم يُستهلك أي سؤال من رصيدك."
+    ),
+    ERR_EMPTY: (
+        "لم يُنتج المزوّد إجابة. يرجى إعادة صياغة السؤال والمحاولة مرة أخرى. "
+        "لم يُستهلك أي سؤال من رصيدك."
+    ),
 }
+
+# Only these are worth a second attempt. 429 is deliberately absent.
+_RETRYABLE = frozenset({ERR_UPSTREAM, ERR_TIMEOUT, ERR_NETWORK})
 
 SYSTEM_PROMPT = """أنت "المدقق الشامل"، مساعد ذكي لتحليل المستندات.
 
@@ -149,6 +203,7 @@ _TASK_OVERVIEW = (
 def build_messages(
     question: str, context: str, mode: str = MODE_FACTUAL
 ) -> list[dict]:
+    """System + user turn. The Responses call maps these to instructions/input."""
     task = _TASK_OVERVIEW if mode == MODE_OVERVIEW else _TASK_FACTUAL
     user_content = (
         "=== سياق المستند غير الموثوق (ابدأ) ===\n"
@@ -162,8 +217,128 @@ def build_messages(
     ]
 
 
-def _should_retry(status: int) -> bool:
-    return status == 429 or 500 <= status < 600
+# --- Provider client -------------------------------------------------------
+# One cached client per credential/endpoint pair. `max_retries=0` is load
+# bearing: the SDK's own retry loop would otherwise re-send rate-limited
+# requests behind our back, which is exactly what we must not do here.
+_client = None
+_client_fingerprint: tuple | None = None
+_client_lock = threading.Lock()
+
+
+def _build_client(api_key: str) -> OpenAI:
+    kwargs: dict = {
+        "api_key": api_key,
+        "timeout": OPENAI_TIMEOUT_SECONDS,
+        "max_retries": 0,
+    }
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+    return OpenAI(**kwargs)
+
+
+def get_client() -> OpenAI:
+    """Return a cached client, rebuilding it if the key/endpoint changed."""
+    global _client, _client_fingerprint
+    api_key = get_openai_api_key()
+    fingerprint = (hash(api_key), OPENAI_BASE_URL)
+    with _client_lock:
+        if _client is None or _client_fingerprint != fingerprint:
+            _client = _build_client(api_key)
+            _client_fingerprint = fingerprint
+        return _client
+
+
+def reset_client() -> None:
+    """Drop the cached client (used by tests and after a config change)."""
+    global _client, _client_fingerprint
+    with _client_lock:
+        _client = None
+        _client_fingerprint = None
+
+
+# --- Error classification --------------------------------------------------
+_CONTEXT_MARKERS = (
+    "context_length_exceeded",
+    "string_above_max_length",
+    "maximum context length",
+    "too many tokens",
+    "request too large",
+    "reduce the length",
+)
+
+
+def _looks_like_context_overflow(exc: Exception) -> bool:
+    code = str(getattr(exc, "code", "") or "").lower()
+    text = f"{code} {exc}".lower()
+    return any(marker in text for marker in _CONTEXT_MARKERS)
+
+
+def _status_of(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def classify_error(exc: Exception) -> str:
+    """Map a provider exception onto one of the ERR_* categories."""
+    if isinstance(exc, APITimeoutError):
+        return ERR_TIMEOUT
+    # APITimeoutError subclasses APIConnectionError, so order matters here.
+    if isinstance(exc, APIConnectionError):
+        return ERR_NETWORK
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return ERR_AUTH
+    if isinstance(exc, RateLimitError):
+        return ERR_RATE_LIMIT
+    if isinstance(exc, NotFoundError):
+        return ERR_MODEL
+    if isinstance(exc, BadRequestError):
+        return (
+            ERR_CONTEXT_TOO_LARGE
+            if _looks_like_context_overflow(exc)
+            else ERR_BAD_REQUEST
+        )
+    if isinstance(exc, InternalServerError):
+        return ERR_UPSTREAM
+    if isinstance(exc, APIStatusError):
+        status = _status_of(exc)
+        if status in (401, 403):
+            return ERR_AUTH
+        if status == 429:
+            return ERR_RATE_LIMIT
+        if status == 404:
+            return ERR_MODEL
+        if status == 413:
+            return ERR_CONTEXT_TOO_LARGE
+        if status is not None and 500 <= status < 600:
+            return ERR_UPSTREAM
+        if status is not None and 400 <= status < 500:
+            return (
+                ERR_CONTEXT_TOO_LARGE
+                if _looks_like_context_overflow(exc)
+                else ERR_BAD_REQUEST
+            )
+    return ERR_UPSTREAM
+
+
+def _extract_text(response) -> str:
+    """Pull the assistant text out of a Responses API result."""
+    text = getattr(response, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    collected: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        for part in getattr(item, "content", None) or []:
+            value = getattr(part, "text", None)
+            if isinstance(value, str) and value.strip():
+                collected.append(value.strip())
+    return "\n".join(collected).strip()
+
+
+def _backoff(attempt: int) -> None:
+    # Bounded exponential backoff for transient faults only: 0.5s, 1s (cap 2s).
+    time.sleep(min(2.0, 0.5 * (2 ** (attempt - 1))))
 
 
 def answer(
@@ -172,96 +347,63 @@ def answer(
     results: list[dict],
     mode: str = MODE_FACTUAL,
 ) -> LLMResult:
-    """Call Groq with the question + bounded context. Never raises for API
+    """Call OpenAI with the question + bounded context. Never raises for API
     errors — returns an LLMResult with an Arabic-safe category instead."""
-    if not groq_is_configured():
+    if not openai_is_configured():
         log_event("llm", session_id, status="not_configured")
         return LLMResult(ok=False, error_category=ERR_NOT_CONFIGURED)
 
     context = build_context(results)
     messages = build_messages(question, context, mode=mode)
-    api_key = get_groq_api_key()
-    model = get_groq_model()
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": GROQ_TEMPERATURE,
-        "max_tokens": GROQ_MAX_OUTPUT_TOKENS,
-        "stream": False,
+    instructions = messages[0]["content"]
+    user_input = messages[1]["content"]
+
+    request: dict = {
+        "model": get_openai_model(),
+        "instructions": instructions,
+        "input": user_input,
+        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+        # Nothing about a demo document should linger in provider storage.
+        "store": False,
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    url = f"{GROQ_BASE_URL}/chat/completions"
+    if OPENAI_TEMPERATURE is not None:
+        request["temperature"] = OPENAI_TEMPERATURE
 
     started = time.time()
-    attempt = 0
     last_category = ERR_UPSTREAM
+    last_status: int | None = None
 
-    while attempt <= GROQ_MAX_RETRIES:
-        attempt += 1
+    for attempt in range(1, OPENAI_MAX_RETRIES + 2):
         try:
-            resp = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=(GROQ_CONNECT_TIMEOUT, GROQ_READ_TIMEOUT),
-            )
-        except requests.Timeout:
-            last_category = ERR_TIMEOUT
-            _backoff(attempt)
-            continue
-        except requests.RequestException:
-            last_category = ERR_NETWORK
-            _backoff(attempt)
-            continue
-
-        status = resp.status_code
-        if status == 200:
-            text = _extract_text(resp)
-            if not text:
-                log_event("llm", session_id, status="empty", http_status=200)
-                return LLMResult(ok=False, error_category=ERR_EMPTY)
+            response = get_client().responses.create(**request)
+        except Exception as exc:  # noqa: BLE001 — categorised, never re-raised
+            last_category = classify_error(exc)
+            last_status = _status_of(exc)
+            if last_category in _RETRYABLE and attempt <= OPENAI_MAX_RETRIES:
+                _backoff(attempt)
+                continue
             log_event(
                 "llm",
                 session_id,
-                status="ok",
-                http_status=200,
-                duration_ms=int((time.time() - started) * 1000),
+                status=last_category,
+                http_status=last_status,
+                attempts=attempt,
             )
-            return LLMResult(ok=True, text=text)
+            return LLMResult(ok=False, error_category=last_category)
 
-        if status in (401, 403):
-            log_event("llm", session_id, status="auth", http_status=status)
-            return LLMResult(ok=False, error_category=ERR_AUTH)
+        text = _extract_text(response)
+        if not text:
+            log_event("llm", session_id, status="empty", attempts=attempt)
+            return LLMResult(ok=False, error_category=ERR_EMPTY)
 
-        if status == 429:
-            last_category = ERR_RATE_LIMIT
-        elif 500 <= status < 600:
-            last_category = ERR_UPSTREAM
-        else:
-            last_category = ERR_UPSTREAM
+        log_event(
+            "llm",
+            session_id,
+            status="ok",
+            attempts=attempt,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+        return LLMResult(ok=True, text=text)
 
-        if _should_retry(status) and attempt <= GROQ_MAX_RETRIES:
-            _backoff(attempt)
-            continue
-
-        log_event("llm", session_id, status=last_category, http_status=status)
-        return LLMResult(ok=False, error_category=last_category)
-
-    log_event("llm", session_id, status=last_category)
+    log_event("llm", session_id, status=last_category, http_status=last_status)
     return LLMResult(ok=False, error_category=last_category)
-
-
-def _extract_text(resp: "requests.Response") -> str:
-    try:
-        data = resp.json()
-        return (data["choices"][0]["message"]["content"] or "").strip()
-    except (ValueError, KeyError, IndexError, TypeError):
-        return ""
-
-
-def _backoff(attempt: int) -> None:
-    # Bounded exponential backoff: 0.5s, 1s, 2s (cap 4s).
-    time.sleep(min(4.0, 0.5 * (2 ** (attempt - 1))))

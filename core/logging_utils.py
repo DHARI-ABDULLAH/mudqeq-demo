@@ -36,6 +36,7 @@ _ALLOWED_FIELDS = {
     "size_bytes",
     "http_status",
     "error_category",
+    "attempts",
 }
 
 

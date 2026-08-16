@@ -103,20 +103,54 @@ def test_session_paths_cannot_escape_the_storage_root():
         session_service.destroy(sid)
 
 
-def test_llm_adapter_targets_groq_only():
+def test_llm_adapter_targets_openai_only():
     from services import llm_service
 
+    assert llm_service.PROVIDER_NAME == "OpenAI"
     source = (WEB_DEMO_ROOT / "services" / "llm_service.py").read_text(encoding="utf-8")
-    assert "api.groq.com" not in source, "base URL must come from config"
-    assert llm_service.GROQ_BASE_URL.startswith("https://")
-    assert "groq" in llm_service.GROQ_BASE_URL
+    assert "api.openai.com" not in source, "endpoint must come from the SDK/config"
+
+
+def test_no_groq_runtime_dependency_remains():
+    requirements = (WEB_DEMO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "groq" not in requirements.lower()
+    assert "openai==" in requirements.lower()
+
+    offenders = []
+    for path in SOURCE_FILES:
+        if "groq" in path.read_text(encoding="utf-8").lower():
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
+    assert not offenders, f"Groq still referenced in: {offenders}"
 
 
 def test_no_api_key_literals_in_source():
-    key_like = re.compile(r"gsk_[A-Za-z0-9]{20,}")
-    offenders = [
-        str(p.relative_to(WEB_DEMO_ROOT))
-        for p in SOURCE_FILES
-        if key_like.search(p.read_text(encoding="utf-8"))
+    # Groq (gsk_) and OpenAI (sk-...) shapes, plus any *_API_KEY assignment.
+    patterns = [
+        re.compile(r"gsk_[A-Za-z0-9]{20,}"),
+        re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+        re.compile(r"API_KEY\s*=\s*[\"'][^\"']+[\"']"),
     ]
+    offenders = []
+    for path in SOURCE_FILES:
+        text = path.read_text(encoding="utf-8")
+        if any(p.search(text) for p in patterns):
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
     assert not offenders, f"hardcoded API key in: {offenders}"
+
+
+def test_api_key_is_only_read_through_the_config_accessor():
+    """No module may reach for the raw environment variable on its own."""
+    offenders = []
+    for path in SOURCE_FILES:
+        if path.name == "config.py":
+            continue
+        if "OPENAI_API_KEY" in path.read_text(encoding="utf-8"):
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
+    assert not offenders, f"OPENAI_API_KEY read outside config.py: {offenders}"
+
+
+def test_logging_whitelist_cannot_carry_a_key_or_content():
+    from core import logging_utils
+
+    forbidden = {"api_key", "key", "token", "text", "content", "question", "answer"}
+    assert not forbidden & logging_utils._ALLOWED_FIELDS

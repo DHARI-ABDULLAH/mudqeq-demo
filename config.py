@@ -8,7 +8,7 @@ This module is completely independent from the desktop application's
 Support, the production SQLite DB, or local Ollama.
 
 Every tunable is read from an environment variable with a conservative,
-demo-safe default. The ONLY value without a default is GROQ_API_KEY.
+demo-safe default. The ONLY value without a default is OPENAI_API_KEY.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def _load_local_dotenv() -> None:
 
     - Only reads ``web_demo/.env`` next to this file — never repo-root ``.env``.
     - Does not override variables already set in the shell (export / HF Secret).
-    - ``python-dotenv`` is optional; without it, use ``export GROQ_API_KEY=...``.
+    - ``python-dotenv`` is optional; without it, use ``export OPENAI_API_KEY=...``.
     """
     env_file = _WEB_DEMO_ROOT / ".env"
     if not env_file.is_file():
@@ -119,15 +119,19 @@ MAX_CHUNKS = _int_env("MAX_CHUNKS", 4000, minimum=10, maximum=50_000)
 # Same model as the desktop product. Runs locally on the demo server.
 EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-small")
 
-# --- Groq (hosted LLM) ----------------------------------------------------
+# --- OpenAI (hosted LLM) --------------------------------------------------
 # NEVER hardcode the key. Sources (first match wins):
 #   1. OS environment variable (export / platform env)
 #   2. web_demo/.env via python-dotenv (local dev only)
-#   3. Streamlit Community Cloud Secrets (st.secrets["GROQ_API_KEY"])
-DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
-GROQ_BASE_URL = os.environ.get(
-    "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
-).rstrip("/")
+#   3. Streamlit Community Cloud Secrets (st.secrets["OPENAI_API_KEY"])
+LLM_PROVIDER = "OpenAI"
+
+# Non-reasoning, low-cost, 128K context — it honours `temperature` and follows
+# the strict "answer only from context" instructions this demo depends on.
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+# Optional override for Azure/proxy deployments. Empty means the SDK default.
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
 
 
 def _read_secret(name: str) -> str:
@@ -145,34 +149,48 @@ def _read_secret(name: str) -> str:
     return ""
 
 
-def get_groq_api_key() -> str:
-    return _read_secret("GROQ_API_KEY")
+def get_openai_api_key() -> str:
+    return _read_secret("OPENAI_API_KEY")
 
 
-def get_groq_model() -> str:
-    return _read_secret("GROQ_MODEL") or DEFAULT_GROQ_MODEL
+def get_openai_model() -> str:
+    return _read_secret("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
 
-
-# Backward-compatible module-level name (resolved at import; prefer getters).
-GROQ_API_KEY = get_groq_api_key()
-GROQ_MODEL = get_groq_model()
 
 # LLM generation controls.
-GROQ_MAX_OUTPUT_TOKENS = _int_env(
-    "GROQ_MAX_OUTPUT_TOKENS", 1024, minimum=64, maximum=8192
+OPENAI_MAX_OUTPUT_TOKENS = _int_env(
+    "OPENAI_MAX_OUTPUT_TOKENS", 1024, minimum=64, maximum=8192
 )
-GROQ_TEMPERATURE = float(os.environ.get("GROQ_TEMPERATURE", "0.2") or "0.2")
-GROQ_CONNECT_TIMEOUT = float(os.environ.get("GROQ_CONNECT_TIMEOUT", "10") or "10")
-GROQ_READ_TIMEOUT = float(os.environ.get("GROQ_READ_TIMEOUT", "60") or "60")
-GROQ_MAX_RETRIES = _int_env("GROQ_MAX_RETRIES", 2, minimum=0, maximum=5)
+
+
+def _temperature_env() -> float | None:
+    """Read OPENAI_TEMPERATURE; an empty value omits the parameter entirely.
+
+    Reasoning-family models reject `temperature`, so operators must be able to
+    switch it off without editing code.
+    """
+    raw = os.environ.get("OPENAI_TEMPERATURE", "0.2")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return max(0.0, min(2.0, float(raw)))
+    except (TypeError, ValueError):
+        return 0.2
+
+
+OPENAI_TEMPERATURE = _temperature_env()
+OPENAI_TIMEOUT_SECONDS = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60") or "60")
+# Retries apply ONLY to transient 5xx/timeout/network failures. Rate limits are
+# never retried: on a shared demo key that would just multiply the throttling.
+OPENAI_MAX_RETRIES = _int_env("OPENAI_MAX_RETRIES", 1, minimum=0, maximum=3)
 
 # --- Question length guard ------------------------------------------------
 MAX_QUESTION_CHARS = _int_env("MAX_QUESTION_CHARS", 2000, minimum=10, maximum=10000)
 
 
-def groq_is_configured() -> bool:
+def openai_is_configured() -> bool:
     """True only if an API key is present (model always has a default)."""
-    return bool(get_groq_api_key())
+    return bool(get_openai_api_key())
 
 
 def ensure_storage_root() -> Path:

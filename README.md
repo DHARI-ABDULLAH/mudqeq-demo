@@ -23,12 +23,12 @@ Browser
       → FAISS IndexFlatIP (per session)
       → Top-K retrieval
       → bounded RAG context (+ prompt-injection defense)
-      → Groq hosted LLM (chat only)
+      → OpenAI hosted LLM (chat only)
       → answer + citations
 ```
 
 The embedding model runs **on the demo server**. Only the **question + a
-bounded set of retrieved chunks** are sent to Groq (chat only). The **Search**
+bounded set of retrieved chunks** are sent to OpenAI (chat only). The **Search**
 page works entirely on the server with **no external LLM call**.
 
 ---
@@ -39,7 +39,7 @@ page works entirely on the server with **no external LLM call**.
 |--------|------------------------------|-----------|
 | App start | Hugging Face (only if model NOT baked in image) | Model files (no user data) |
 | Upload / Extract / Index / **Search** | none | none leaves the server |
-| **Chat** | Groq API (`api.groq.com`) | Question + minimum Top-K retrieved chunks + page numbers |
+| **Chat** | OpenAI API (`api.openai.com`) | Question + minimum Top-K retrieved chunks + page numbers |
 
 The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 
@@ -49,8 +49,13 @@ The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `GROQ_API_KEY` | **Yes (chat)** | — | Groq API key (Streamlit **Secrets** or `.env` local) |
-| `GROQ_MODEL` | No | `llama-3.1-8b-instant` | Hosted model id |
+| `OPENAI_API_KEY` | **Yes (chat)** | — | OpenAI API key (Streamlit **Secrets** or `.env` local) |
+| `OPENAI_MODEL` | No | `gpt-4o-mini` | Hosted model id |
+| `OPENAI_MAX_OUTPUT_TOKENS` | No | `1024` | Answer length cap |
+| `OPENAI_TEMPERATURE` | No | `0.2` | Empty value omits the parameter (reasoning models) |
+| `OPENAI_TIMEOUT_SECONDS` | No | `60` | Per-request timeout |
+| `OPENAI_MAX_RETRIES` | No | `1` | Transient 5xx/network only — **never** rate limits |
+| `OPENAI_BASE_URL` | No | — | Override endpoint (Azure/proxy) |
 | `MAX_FILE_SIZE_MB` | No | `10` | Max upload size |
 | `MAX_PAGES` | No | `50` | Max pages per PDF |
 | `MAX_FILES_PER_SESSION` | No | `1` | Live documents per session |
@@ -61,7 +66,7 @@ The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 | `MAX_RAG_CONTEXT_CHARS` | No | `6000` | Context sent to LLM |
 | `DEMO_STORAGE_ROOT` | No | `/tmp/mudqeq_demo` | Ephemeral storage root |
 
-**Never** put `GROQ_API_KEY` in source, git, or README — only:
+**Never** put `OPENAI_API_KEY` in source, git, or README — only:
 - **Local:** `web_demo/.env` (gitignored)
 - **Streamlit Cloud:** App → Settings → Secrets
 
@@ -78,14 +83,14 @@ The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 | Railway | ❌ | — | no real free tier |
 | HF Docker Space | ❌ PRO | 16 GB | requires paid plan |
 
-**Recommended:** [Streamlit Community Cloud](https://share.streamlit.io/) — native Streamlit, HTTPS public URL, Secrets for `GROQ_API_KEY`, **no Docker**, **no credit card**.
+**Recommended:** [Streamlit Community Cloud](https://share.streamlit.io/) — native Streamlit, HTTPS public URL, Secrets for `OPENAI_API_KEY`, **no Docker**, **no credit card**.
 
 > **RAM note:** PyTorch (CPU) + `multilingual-e5-small` + FAISS uses ~**2–2.5 GB** at peak. Streamlit Cloud allows up to **~2.7 GB**. The demo may work for light usage; heavy concurrent traffic could hit limits. Monitor logs after deploy.
 
 ### Prerequisites
 
 - GitHub account (public repo required on free tier)
-- Groq API key
+- OpenAI API key
 - Repository containing **only** `web_demo/` files (root = app files)
 
 ### Step-by-step (you deploy — we do not push)
@@ -113,8 +118,8 @@ The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 
 7. **Advanced settings → Secrets** — paste:
    ```toml
-   GROQ_API_KEY = "your-groq-key-here"
-   GROQ_MODEL = "llama-3.1-8b-instant"
+   OPENAI_API_KEY = "your-openai-key-here"
+   OPENAI_MODEL = "gpt-4o-mini"
    ```
    (Use your real key; never commit this to git.)
 
@@ -159,15 +164,15 @@ pip install -r requirements.txt
 
 # Option A — .env file (recommended for local dev):
 cp .env.example .env
-# Edit .env and set GROQ_API_KEY=your_key_here  (never commit .env)
+# Edit .env and set OPENAI_API_KEY=your_key_here  (never commit .env)
 
 # Option B — shell export (no .env file):
-# export GROQ_API_KEY=your_key_here
+# export OPENAI_API_KEY=your_key_here
 
 streamlit run app.py
 ```
 
-**Chat** requires `GROQ_API_KEY`. **Search** works without it. The key is read
+**Chat** requires `OPENAI_API_KEY`. **Search** works without it. The key is read
 only by Python on the server — never sent to the browser.
 
 Open http://localhost:8501 (Streamlit default port).
@@ -194,7 +199,7 @@ See `Dockerfile` and build with Docker only if you have HF PRO. Not recommended 
 ```bash
 cd web_demo
 docker build -t mudqeq-demo .
-docker run --rm -p 7860:7860 -e GROQ_API_KEY=... mudqeq-demo
+docker run --rm -p 7860:7860 -e OPENAI_API_KEY=... mudqeq-demo
 ```
 
 ---
@@ -207,8 +212,8 @@ Build the image using **`web_demo/` as the context** (do NOT use the repo root):
 cd web_demo
 docker build -t mudqeq-demo .
 docker run --rm -p 7860:7860 \
-  -e GROQ_API_KEY=sk-... \
-  -e GROQ_MODEL=llama-3.1-8b-instant \
+  -e OPENAI_API_KEY=sk-... \
+  -e OPENAI_MODEL=gpt-4o-mini \
   mudqeq-demo
 ```
 
@@ -227,7 +232,7 @@ Open http://localhost:7860
 | torch + FAISS + embeddings | بطيء/هشّ عند كل build | ✅ model مُدمج في الصورة |
 | حجم build | غير متوقع | ✅ Dockerfile ثابت |
 | non-root + healthcheck | محدود | ✅ مُفعّل |
-| Groq secrets | ✅ | ✅ |
+| OpenAI secrets | ✅ | ✅ |
 
 **لا تستخدم** Streamlit SDK مباشرة لهذا المشروع — dependencies ثقيلة (PyTorch ~2 GB + embedding model ~470 MB).
 
@@ -240,8 +245,8 @@ Open http://localhost:7860
 | **SDK** | **Docker** |
 | **Hardware** | **CPU basic** (16 GB RAM) — كافٍ للديمو |
 | **Visibility** | Public (للحصول على Public URL) |
-| **Secret** | `GROQ_API_KEY` = مفتاح Groq |
-| **Variable** (اختياري) | `GROQ_MODEL` = `llama-3.1-8b-instant` |
+| **Secret** | `OPENAI_API_KEY` = مفتاح OpenAI |
+| **Variable** (اختياري) | `OPENAI_MODEL` = `gpt-4o-mini` |
 
 > قد يتطلب Hugging Face **حساب PRO** لإنشاء Docker Space (سياسة HF 2025+). Static Spaces مجانية؛ Docker/Gradio compute قد تحتاج PRO.
 
@@ -268,7 +273,7 @@ tests/             ← اختياري (لا تُنسخ داخل Docker image)
 **ممنوع رفعها:**
 
 ```
-.env               ← فيه GROQ_API_KEY — NEVER
+.env               ← فيه OPENAI_API_KEY — NEVER
 *.pdf / *.faiss / storage/ / uploads/ / temp/
 __pycache__/ / .pytest_cache/ / .venv/
 desktop/ / data/ / packaging/ (خارج web_demo أصلاً)
@@ -296,11 +301,11 @@ desktop/ / data/ / packaging/ (خارج web_demo أصلاً)
    ⚠️ قبل `git add .` تأكد: `git check-ignore -v .env` يُظهر أن `.env` مُتجاهَل.
 
 3. **Space → Settings → Secrets** → أضف:
-   - Name: `GROQ_API_KEY`
-   - Value: مفتاح Groq (لا تضعه في Git)
+   - Name: `OPENAI_API_KEY`
+   - Value: مفتاح OpenAI (لا تضعه في Git)
 
 4. **(اختياري) Settings → Variables**:
-   - `GROQ_MODEL` = `llama-3.1-8b-instant`
+   - `OPENAI_MODEL` = `gpt-4o-mini`
 
 5. **انتظر Build** (15–30 دقيقة أول مرة — تحميل PyTorch + baking embedding model).
 
@@ -330,9 +335,9 @@ desktop/ / data/ / packaging/ (خارج web_demo أصلاً)
    git push space main
    ```
 3. In **Space → Settings → Secrets**, add:
-   - `GROQ_API_KEY` = your Groq key  (**Secret**)
+   - `OPENAI_API_KEY` = your OpenAI key  (**Secret**)
 4. In **Space → Settings → Variables** (optional):
-   - `GROQ_MODEL` = `llama-3.1-8b-instant` (or another current Groq model)
+   - `OPENAI_MODEL` = `gpt-4o-mini` (or another current OpenAI model)
 5. Let the Space **build** (first build downloads/bakes the embedding model).
 6. Check **build + runtime logs** for a successful start on port 7860.
 7. Open the Space URL and test: consent → upload a small PDF → search → chat →
@@ -348,6 +353,6 @@ desktop/ / data/ / packaging/ (خارج web_demo أصلاً)
 ## What is NOT included (by design)
 
 - No desktop code (`desktop/`, Tauri, FastAPI sidecar, PyInstaller).
-- No Ollama. The demo uses a hosted LLM (Groq) instead.
+- No Ollama. The demo uses a hosted LLM (OpenAI) instead.
 - No client documents, production `storage/`, `index/`, `app.db`, or reports.
 - No analytics / telemetry.

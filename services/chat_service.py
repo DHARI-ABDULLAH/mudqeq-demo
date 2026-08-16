@@ -4,14 +4,17 @@ web_demo/services/chat_service.py
 The chat pipeline's decision logic, kept out of the Streamlit layer so it can
 be tested directly:
 
-    question -> intent -> (retrieval | document context) -> quota -> Groq
+    question -> intent -> (retrieval | document context) -> OpenAI -> quota
 
-Two rules this module exists to guarantee:
+Three rules this module exists to guarantee:
 
 1. An unreadable index NEVER masquerades as "the document has no information".
    It returns ``KIND_INDEX_ERROR`` instead.
-2. The hosted LLM is only ever called after context was genuinely gathered, and
-   the session's question quota is only spent on such calls.
+2. The hosted LLM is only ever called after context was genuinely gathered.
+3. The session's question quota is spent only once the provider has actually
+   returned a usable answer. A 401/429/5xx/timeout/empty response costs the
+   user nothing, and is reported as ``KIND_PROVIDER_ERROR`` — never as an
+   answer.
 
 Contains no Streamlit import and no document text in its diagnostics.
 """
@@ -30,6 +33,7 @@ KIND_NO_CONTENT = "no_content"
 KIND_INDEX_ERROR = "index_error"
 KIND_NO_SELECTION = "no_selection"
 KIND_QUOTA = "quota_exceeded"
+KIND_PROVIDER_ERROR = "provider_error"
 
 INDEX_ERROR_MESSAGE = (
     "تعذر الوصول إلى فهرس المستند. أعد رفع المستند أو أعد المحاولة."
@@ -119,13 +123,31 @@ def respond(
             diagnostics=_diag(len(selected), len(valid), 0),
         )
 
-    # Only a turn that actually reached the model costs the user a question.
-    session_service.record_question(session_id)
     result = llm_service.answer(session_id, question, results, mode=mode)
+
+    if not result.ok:
+        # The provider failed us, not the user — their quota stays untouched.
+        log_event(
+            "chat", session_id, status="provider_error", error_category=result.error_category
+        )
+        return ChatOutcome(
+            kind=KIND_PROVIDER_ERROR,
+            mode=mode,
+            text=result.user_message,
+            sources=results,
+            diagnostics=_diag(
+                len(selected), len(valid), len(results), error=result.error_category
+            ),
+            llm_called=True,
+            error_reason=result.error_category,
+        )
+
+    # Only a turn that produced a real answer costs the user a question.
+    session_service.record_question(session_id)
     return ChatOutcome(
         kind=KIND_ANSWER,
         mode=mode,
-        text=result.user_message,
+        text=result.text,
         sources=results,
         diagnostics=_diag(len(selected), len(valid), len(results)),
         llm_called=True,

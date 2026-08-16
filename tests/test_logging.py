@@ -61,21 +61,58 @@ def test_session_id_is_hashed():
     assert logging_utils.hash_session(raw) in out
 
 
-def test_groq_key_never_logged_or_returned(monkeypatch):
-    monkeypatch.setattr(llm_service, "groq_is_configured", lambda: True)
-    monkeypatch.setattr(llm_service, "get_groq_api_key", lambda: "sk-super-secret-key")
-    monkeypatch.setattr(llm_service, "GROQ_MAX_RETRIES", 0)
+def test_openai_key_never_logged_or_returned(monkeypatch):
+    import httpx
+    from openai import InternalServerError
 
-    class _Resp:
-        status_code = 500
+    monkeypatch.setattr(llm_service, "openai_is_configured", lambda: True)
+    monkeypatch.setattr(llm_service, "get_openai_api_key", lambda: "sk-super-secret-key")
+    monkeypatch.setattr(llm_service, "get_openai_model", lambda: "gpt-4o-mini")
+    monkeypatch.setattr(llm_service, "OPENAI_MAX_RETRIES", 0)
 
-        def json(self):
-            return {}
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    error = InternalServerError(
+        "Internal server error",
+        response=httpx.Response(500, request=request, json={"error": {}}),
+        body={},
+    )
 
-    monkeypatch.setattr(llm_service.requests, "post", lambda *a, **k: _Resp())
+    class _Responses:
+        def create(self, **kwargs):
+            raise error
+
+    class _Client:
+        responses = _Responses()
+
+    monkeypatch.setattr(llm_service, "get_client", lambda: _Client())
     with capture_logs() as buf:
         res = llm_service.answer("sid", "question", [{"text": "c", "page_start": 1, "page_end": 1}])
     out = buf.getvalue()
     assert "sk-super-secret-key" not in out
     assert "sk-super-secret-key" not in res.user_message
     assert res.ok is False
+
+
+def test_llm_answer_logs_status_without_content(monkeypatch):
+    monkeypatch.setattr(llm_service, "openai_is_configured", lambda: True)
+    monkeypatch.setattr(llm_service, "get_openai_model", lambda: "gpt-4o-mini")
+
+    class _Response:
+        output_text = "SECRET-ANSWER-TEXT"
+
+    class _Client:
+        class responses:  # noqa: N801 - test double
+            @staticmethod
+            def create(**kwargs):
+                return _Response()
+
+    monkeypatch.setattr(llm_service, "get_client", lambda: _Client())
+    with capture_logs() as buf:
+        res = llm_service.answer(
+            "sid", "MY-PRIVATE-QUESTION", [{"text": "c", "page_start": 1, "page_end": 1}]
+        )
+    out = buf.getvalue()
+    assert res.ok is True
+    assert "SECRET-ANSWER-TEXT" not in out
+    assert "MY-PRIVATE-QUESTION" not in out
+    assert '"status": "ok"' in out

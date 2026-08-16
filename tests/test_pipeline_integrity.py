@@ -270,7 +270,7 @@ def test_chat_index_failure_does_not_call_llm_or_spend_quota(new_session, monkey
     assert outcome.text == chat_service.INDEX_ERROR_MESSAGE
     assert outcome.text != chat_service.NO_CONTENT_MESSAGE
     assert outcome.llm_called is False
-    assert called == [], "Groq must not be called when the index is unreadable"
+    assert called == [], "OpenAI must not be called when the index is unreadable"
     assert session_service.remaining_questions(new_session) == before
 
 
@@ -361,7 +361,7 @@ def test_chat_diagnostics_are_counts_only(new_session, monkeypatch):
     assert outcome.diagnostics["retrieved_results_count"] >= 1
 
 
-def test_groq_auth_failure_is_distinct_from_no_content(new_session, monkeypatch):
+def test_provider_auth_failure_is_distinct_from_no_content(new_session, monkeypatch):
     res = _ingest(new_session)
     monkeypatch.setattr(
         llm_service,
@@ -372,7 +372,96 @@ def test_groq_auth_failure_is_distinct_from_no_content(new_session, monkeypatch)
     )
     outcome = chat_service.respond(new_session, "ssh port", [res.document_id])
 
-    assert outcome.kind == chat_service.KIND_ANSWER  # retrieval succeeded
+    assert outcome.kind == chat_service.KIND_PROVIDER_ERROR  # retrieval succeeded
+    assert outcome.ok is False
     assert outcome.text != chat_service.NO_CONTENT_MESSAGE
     assert outcome.text != chat_service.INDEX_ERROR_MESSAGE
     assert "مفتاح الخدمة" in outcome.text
+    assert outcome.error_reason == llm_service.ERR_AUTH
+
+
+# --- Question quota is spent only on a real answer -----------------------
+@pytest.mark.parametrize(
+    "category",
+    [
+        llm_service.ERR_AUTH,
+        llm_service.ERR_RATE_LIMIT,
+        llm_service.ERR_BAD_REQUEST,
+        llm_service.ERR_MODEL,
+        llm_service.ERR_CONTEXT_TOO_LARGE,
+        llm_service.ERR_UPSTREAM,
+        llm_service.ERR_TIMEOUT,
+        llm_service.ERR_NETWORK,
+        llm_service.ERR_EMPTY,
+        llm_service.ERR_NOT_CONFIGURED,
+    ],
+)
+def test_provider_failure_never_spends_a_question(new_session, monkeypatch, category):
+    res = _ingest(new_session)
+    monkeypatch.setattr(
+        llm_service,
+        "answer",
+        lambda *a, **k: llm_service.LLMResult(ok=False, error_category=category),
+    )
+    before = session_service.remaining_questions(new_session)
+
+    outcome = chat_service.respond(new_session, "ssh port", [res.document_id])
+
+    assert outcome.kind == chat_service.KIND_PROVIDER_ERROR
+    assert session_service.remaining_questions(new_session) == before
+    assert "لم يُستهلك أي سؤال" in outcome.text
+
+
+def test_repeated_provider_failures_leave_the_quota_untouched(new_session, monkeypatch):
+    res = _ingest(new_session)
+    monkeypatch.setattr(
+        llm_service,
+        "answer",
+        lambda *a, **k: llm_service.LLMResult(
+            ok=False, error_category=llm_service.ERR_RATE_LIMIT
+        ),
+    )
+    before = session_service.remaining_questions(new_session)
+    for _ in range(5):
+        chat_service.respond(new_session, "ssh port", [res.document_id])
+    assert session_service.remaining_questions(new_session) == before
+
+
+def test_no_content_never_spends_a_question(new_session, monkeypatch):
+    res = _ingest(new_session)
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda *a, **k: [])
+    called = []
+    monkeypatch.setattr(llm_service, "answer", lambda *a, **k: called.append(1))
+    before = session_service.remaining_questions(new_session)
+
+    outcome = chat_service.respond(new_session, "which port allows ssh?", [res.document_id])
+
+    assert outcome.kind == chat_service.KIND_NO_CONTENT
+    assert called == []
+    assert session_service.remaining_questions(new_session) == before
+
+
+def test_successful_answer_text_is_the_model_output_not_an_error(new_session, monkeypatch):
+    res = _ingest(new_session)
+    monkeypatch.setattr(
+        llm_service,
+        "answer",
+        lambda *a, **k: llm_service.LLMResult(ok=True, text="المنفذ 22 (صفحة 2)"),
+    )
+    outcome = chat_service.respond(new_session, "ssh port", [res.document_id])
+    assert outcome.ok is True
+    assert outcome.text == "المنفذ 22 (صفحة 2)"
+
+
+def test_provider_error_keeps_the_retrieved_sources_visible(new_session, monkeypatch):
+    res = _ingest(new_session)
+    monkeypatch.setattr(
+        llm_service,
+        "answer",
+        lambda *a, **k: llm_service.LLMResult(
+            ok=False, error_category=llm_service.ERR_RATE_LIMIT
+        ),
+    )
+    outcome = chat_service.respond(new_session, "ssh port", [res.document_id])
+    assert outcome.sources, "retrieval succeeded, so its citations stay available"
+    assert all("page_start" in s for s in outcome.sources)
