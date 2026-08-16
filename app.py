@@ -166,6 +166,19 @@ def _search_max_results() -> int:
     return max(1, _cfg_int("SEARCH_MAX_RESULTS", 20))
 
 
+def _upload_limits_caption() -> str:
+    fn = getattr(config, "upload_limits_caption_ar", None)
+    if fn is not None:
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            pass
+    return (
+        f"PDF فقط، بحد أقصى {_cfg_int('MAX_FILE_SIZE_MB', 50)} ميغابايت و"
+        f"{_cfg_int('MAX_PAGES', 200)} صفحة لكل ملف."
+    )
+
+
 def _search_default_results() -> int:
     return min(max(1, _cfg_int("SEARCH_DEFAULT_RESULTS", 8)), _search_max_results())
 
@@ -629,10 +642,7 @@ def page_documents() -> None:
                 f"تم الوصول إلى الحد الأقصى ({max_files} مستندات). "
                 "احذف مستنداً لإضافة آخر."
             )
-        st.caption(
-            f"PDF فقط · بحد أقصى {_cfg_int('MAX_FILE_SIZE_MB', 10)} ميغابايت و"
-            f"{_cfg_int('MAX_PAGES', 50)} صفحة لكل ملف."
-        )
+        st.caption(_upload_limits_caption())
         uploaded = st.file_uploader(
             "اختر ملف PDF (يمكن اختيار أكثر من ملف)",
             type=["pdf"],
@@ -948,8 +958,8 @@ def page_about() -> None:
 
 ### الحدود الحالية للنسخة التجريبية
 
-- الحجم الأقصى للملف: {_cfg_int('MAX_FILE_SIZE_MB', 10)} ميغابايت.
-- الحد الأقصى للصفحات: {_cfg_int('MAX_PAGES', 50)} صفحة لكل ملف.
+- الحجم الأقصى للملف: {_cfg_int('MAX_FILE_SIZE_MB', 50)} ميغابايت.
+- الحد الأقصى للصفحات: {_cfg_int('MAX_PAGES', 200)} صفحة لكل ملف.
 - عدد المستندات في الجلسة: {_max_files_per_session()}.
 - الحد الأقصى للأسئلة في الجلسة: {_cfg_int('MAX_QUESTIONS_PER_SESSION', 20)}.
 - مدة الجلسة قبل الحذف التلقائي: {_cfg_int('SESSION_TTL_MINUTES', 30)} دقيقة.

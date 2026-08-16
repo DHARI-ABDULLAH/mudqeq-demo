@@ -68,9 +68,9 @@ DEMO_STORAGE_ROOT = Path(
 ).resolve()
 
 # --- Upload safety limits -------------------------------------------------
-MAX_FILE_SIZE_MB = _int_env("MAX_FILE_SIZE_MB", 10, minimum=1, maximum=50)
+MAX_FILE_SIZE_MB = _int_env("MAX_FILE_SIZE_MB", 50, minimum=1, maximum=100)
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-MAX_PAGES = _int_env("MAX_PAGES", 50, minimum=1, maximum=500)
+MAX_PAGES = _int_env("MAX_PAGES", 200, minimum=1, maximum=500)
 # The demo supports MULTIPLE documents per session (like the desktop app),
 # bounded to protect the shared public server.
 MAX_FILES_PER_SESSION = _int_env("MAX_FILES_PER_SESSION", 5, minimum=1, maximum=20)
@@ -115,6 +115,14 @@ MAX_EXTRACTED_CHARS = _int_env(
     "MAX_EXTRACTED_CHARS", 2_000_000, minimum=10_000, maximum=20_000_000
 )
 MAX_CHUNKS = _int_env("MAX_CHUNKS", 4000, minimum=10, maximum=50_000)
+
+
+def upload_limits_caption_ar() -> str:
+    """Arabic upload hint for the UI — always matches server-side validation."""
+    return (
+        f"PDF فقط، بحد أقصى {MAX_FILE_SIZE_MB} ميغابايت و"
+        f"{MAX_PAGES} صفحة لكل ملف."
+    )
 
 # --- Embeddings -----------------------------------------------------------
 # Same model as the desktop product. Runs locally on the demo server.
