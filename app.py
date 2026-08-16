@@ -19,6 +19,7 @@ import streamlit as st
 
 import config
 import app_config
+import compat
 from core.logging_utils import log_event
 from services import (
     cleanup_service,
@@ -121,7 +122,7 @@ def page_documents() -> None:
         "المستندات", "أضف مستنداتك وأدرها مؤقتاً ضمن جلستك التجريبية."
     )
 
-    live = session_service.live_document_count(_sid())
+    live = compat.live_document_count(_sid())
     can_add = live < app_config.max_files_per_session()
 
     with st.expander("＋ إضافة مستند جديد", expanded=(live == 0)):
@@ -144,19 +145,19 @@ def page_documents() -> None:
         if uploaded and st.button("رفع وفهرسة", type="primary", disabled=not can_add):
             _ingest_uploads(uploaded)
 
-    docs = session_service.list_documents(_sid())
+    docs = compat.list_documents(_sid())
     if not docs:
         st.info("لا توجد مستندات بعد. أضف مستنداً للبدء.")
         return
 
     st.markdown("### مستنداتك")
     for doc in docs:
-        components.document_card(doc)
+        compat.render_document_card(doc)
         if st.session_state.get("confirm_delete") == doc.document_id:
             st.warning(f"هل أنت متأكد من حذف: {doc.display_name}؟ لا يمكن التراجع.")
             c1, c2 = st.columns(2)
             if c1.button("نعم، احذف", key=f"yes_{doc.document_id}", type="primary"):
-                document_service.delete_document(_sid(), doc.document_id)
+                compat.delete_document(_sid(), doc.document_id)
                 st.session_state["confirm_delete"] = None
                 st.success("تم حذف المستند.")
                 st.rerun()
@@ -212,7 +213,7 @@ def page_search() -> None:
     components.page_header(
         "البحث", "بحث دلالي مباشر داخل مستنداتك — بدون نموذج ذكاء اصطناعي خارجي."
     )
-    ready = session_service.ready_documents(_sid())
+    ready = compat.ready_documents(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -254,7 +255,7 @@ def page_chat() -> None:
     components.page_header(
         "المحادثة", "اسأل عن محتوى مستنداتك واحصل على إجابة بمصادرها."
     )
-    ready = session_service.ready_documents(_sid())
+    ready = compat.ready_documents(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -390,10 +391,7 @@ def main() -> None:
 
     page = st.session_state["page"]
     if page != "about":
-        components.dashboard(
-            session_service.stats(_sid()),
-            session_service.remaining_questions(_sid()),
-        )
+        compat.render_dashboard(_sid())
     PAGES.get(page, page_documents)()
 
 

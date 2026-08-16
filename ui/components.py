@@ -131,6 +131,21 @@ def document_card(doc) -> None:
     )
 
 
+def session_dashboard(doc) -> None:
+    """Backward-compatible alias for older app versions (single-document view)."""
+    if doc is None:
+        dashboard({"num_documents": 0, "total_pages": 0, "total_chunks": 0}, 0)
+    else:
+        dashboard(
+            {
+                "num_documents": 1,
+                "total_pages": doc.num_pages,
+                "total_chunks": doc.num_chunks,
+            },
+            0,
+        )
+
+
 def source_card(result: dict) -> None:
     ps, pe = result.get("page_start"), result.get("page_end")
     if ps and pe and ps != pe:
