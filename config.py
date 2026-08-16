@@ -14,6 +14,7 @@ demo-safe default. The ONLY value without a default is OPENAI_API_KEY.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 _WEB_DEMO_ROOT = Path(__file__).resolve().parent
@@ -136,18 +137,26 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
 # Fallback locations when operators nest secrets under a TOML section instead of
 # placing OPENAI_* keys at the top level (a common Streamlit Cloud mistake).
 _OPENAI_KEY_NESTED_PATHS: tuple[tuple[str, ...], ...] = (
+    ("secrets", "OPENAI_API_KEY"),
+    ("secrets", "OPENAI_KEY"),
     ("openai", "api_key"),
     ("openai", "API_KEY"),
     ("openai", "OPENAI_API_KEY"),
+    ("openai", "OPENAI_KEY"),
     ("OPENAI", "API_KEY"),
     ("OPENAI", "OPENAI_API_KEY"),
 )
 _OPENAI_MODEL_NESTED_PATHS: tuple[tuple[str, ...], ...] = (
+    ("secrets", "OPENAI_MODEL"),
     ("openai", "model"),
     ("openai", "OPENAI_MODEL"),
     ("OPENAI", "MODEL"),
     ("OPENAI", "OPENAI_MODEL"),
 )
+_OPENAI_KEY_ALIASES: frozenset[str] = frozenset(
+    {"OPENAI_API_KEY", "OPENAI_KEY", "openai_api_key", "api_key", "API_KEY"}
+)
+_OPENAI_KEY_ENV_ALIASES: tuple[str, ...] = ("OPENAI_API_KEY", "OPENAI_KEY")
 
 
 def _env_non_empty(name: str) -> str:
@@ -156,6 +165,128 @@ def _env_non_empty(name: str) -> str:
     if raw is None:
         return ""
     return raw.strip()
+
+
+def _is_secret_mapping(node: object) -> bool:
+    return isinstance(node, Mapping) and not isinstance(node, (str, bytes))
+
+
+def _streamlit_secrets_status() -> dict[str, str]:
+    """Safe metadata about ``st.secrets`` — key names only, never values."""
+    try:
+        import streamlit as st
+        from streamlit.errors import StreamlitSecretNotFoundError
+    except ImportError:
+        return {
+            "loaded": "no",
+            "key_names": "",
+            "hint": "streamlit unavailable",
+        }
+
+    try:
+        secrets = st.secrets
+        names: list[str] = []
+        for top in secrets.keys():
+            names.append(str(top))
+            try:
+                child = secrets[top]
+            except KeyError:
+                continue
+            if _is_secret_mapping(child):
+                for sub in child.keys():
+                    names.append(f"{top}.{sub}")
+
+        hint = ""
+        flat = set(names)
+        nested_flat = {n.split(".", 1)[-1] for n in names if "." in n}
+        has_openai = any(n in _OPENAI_KEY_ALIASES for n in (*flat, *nested_flat))
+        if "GROQ_API_KEY" in flat and not has_openai:
+            hint = (
+                "وُجد GROQ_API_KEY لكن لا يوجد OPENAI_API_KEY — "
+                "حدّث Secrets في Streamlit Cloud."
+            )
+        elif not names:
+            hint = (
+                "لا توجد Secrets محمّلة — أضف OPENAI_API_KEY في "
+                "App Settings → Secrets ثم Reboot."
+            )
+        elif not has_openai:
+            hint = (
+                "Secrets موجودة لكن OPENAI_API_KEY غير موجود. "
+                f"المفاتيح الحالية: {', '.join(names)}"
+            )
+
+        return {
+            "loaded": "yes",
+            "key_names": ", ".join(names) if names else "(none)",
+            "hint": hint,
+        }
+    except StreamlitSecretNotFoundError:
+        return {
+            "loaded": "no",
+            "key_names": "",
+            "hint": (
+                "ملف Secrets غير موجود — الصق OPENAI_API_KEY في "
+                "App Settings → Secrets ثم Reboot."
+            ),
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "loaded": "error",
+            "key_names": "",
+            "hint": "تعذّر قراءة st.secrets.",
+        }
+
+
+def _scan_secrets_for_openai_key() -> str:
+    """Scan top-level and one-level nested ``st.secrets`` for OpenAI key aliases."""
+    try:
+        import streamlit as st
+        from streamlit.errors import StreamlitSecretNotFoundError
+    except ImportError:
+        return ""
+
+    try:
+        secrets = st.secrets
+        for alias in _OPENAI_KEY_ALIASES:
+            try:
+                value = secrets[alias]
+            except KeyError:
+                value = None
+            if value is not None and not _is_secret_mapping(value):
+                text = str(value).strip()
+                if text:
+                    return text
+
+        for top in secrets.keys():
+            try:
+                child = secrets[top]
+            except KeyError:
+                continue
+            if not _is_secret_mapping(child):
+                continue
+            for alias in _OPENAI_KEY_ALIASES:
+                try:
+                    value = child[alias]
+                except KeyError:
+                    continue
+                if not _is_secret_mapping(value):
+                    text = str(value).strip()
+                    if text:
+                        return text
+    except StreamlitSecretNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _read_openai_api_key_from_streamlit() -> str:
+    for alias in ("OPENAI_API_KEY", "OPENAI_KEY"):
+        text = _read_from_streamlit_secrets(alias, nested_paths=_OPENAI_KEY_NESTED_PATHS)
+        if text:
+            return text
+    return _scan_secrets_for_openai_key()
 
 
 def _walk_secrets(node: object, path: tuple[str, ...]) -> str:
@@ -193,7 +324,7 @@ def _read_from_streamlit_secrets(
         secrets = st.secrets
         try:
             value = secrets[name]
-            if not isinstance(value, dict):
+            if not _is_secret_mapping(value):
                 text = str(value).strip()
                 if text:
                     return text
@@ -212,21 +343,19 @@ def _read_from_streamlit_secrets(
 
 
 def _read_secret(name: str) -> str:
-    """Read a secret from env or Streamlit Cloud secrets (never log the value).
+    """Read a secret from env or Streamlit Cloud secrets (never log the value)."""
+    if name == "OPENAI_API_KEY":
+        for alias in _OPENAI_KEY_ENV_ALIASES:
+            if val := _env_non_empty(alias):
+                return val
+        return _read_openai_api_key_from_streamlit()
 
-    Resolution order:
-    1. Non-empty ``os.environ[name]`` (includes values promoted from secrets)
-    2. Top-level ``st.secrets[name]``
-    3. Known nested layouts for OpenAI keys/models
-    """
     val = _env_non_empty(name)
     if val:
         return val
 
     nested: tuple[tuple[str, ...], ...] = ()
-    if name == "OPENAI_API_KEY":
-        nested = _OPENAI_KEY_NESTED_PATHS
-    elif name == "OPENAI_MODEL":
+    if name == "OPENAI_MODEL":
         nested = _OPENAI_MODEL_NESTED_PATHS
 
     return _read_from_streamlit_secrets(name, nested_paths=nested)
@@ -234,11 +363,10 @@ def _read_secret(name: str) -> str:
 
 def _detect_api_key_source() -> str:
     """Return where the OpenAI key was found — never the key itself."""
-    if _env_non_empty("OPENAI_API_KEY"):
-        return "environment"
-    if _read_from_streamlit_secrets(
-        "OPENAI_API_KEY", nested_paths=_OPENAI_KEY_NESTED_PATHS
-    ):
+    for alias in _OPENAI_KEY_ENV_ALIASES:
+        if _env_non_empty(alias):
+            return "environment"
+    if _read_openai_api_key_from_streamlit():
         return "st.secrets"
     return "missing"
 
@@ -248,12 +376,21 @@ def openai_config_diagnostics() -> dict[str, str]:
     model = get_openai_model()
     source = _detect_api_key_source()
     detected = source != "missing"
+    secrets_status = streamlit_secrets_status()
     return {
         "openai_configured": "yes" if detected else "no",
         "openai_model": model,
         "api_key_detected": "yes" if detected else "no",
         "api_key_source": source,
+        "streamlit_secrets_loaded": secrets_status["loaded"],
+        "secret_key_names": secrets_status["key_names"],
+        "configuration_hint": secrets_status["hint"],
     }
+
+
+def streamlit_secrets_status() -> dict[str, str]:
+    """Public wrapper for safe Streamlit secrets metadata."""
+    return _streamlit_secrets_status()
 
 
 def get_openai_api_key() -> str:

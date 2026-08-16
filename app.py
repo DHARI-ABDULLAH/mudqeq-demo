@@ -440,6 +440,9 @@ def _llm_diagnostics() -> dict:
         "OpenAI model": model or getattr(config, "DEFAULT_OPENAI_MODEL", "غير معروف"),
         "API key detected": base.get("api_key_detected", configured),
         "API key source": base.get("api_key_source", "missing"),
+        "Streamlit secrets loaded": base.get("streamlit_secrets_loaded", "unknown"),
+        "Secret key names": base.get("secret_key_names", ""),
+        "Configuration hint": base.get("configuration_hint", ""),
         "LLM provider": getattr(config, "LLM_PROVIDER", "OpenAI"),
         "Max output tokens": getattr(config, "OPENAI_MAX_OUTPUT_TOKENS", None),
         "Max RAG context chars": _cfg_int("MAX_RAG_CONTEXT_CHARS", 6000),
@@ -756,7 +759,11 @@ def page_chat() -> None:
             "يمكنك استخدام **البحث** الذي يعمل محلياً على الخادم."
         )
         with st.expander("تشخيص إعداد OpenAI (آمن — بدون عرض المفتاح)"):
-            st.json(_llm_diagnostics())
+            diag = _llm_diagnostics()
+            st.json(diag)
+            hint = diag.get("Configuration hint")
+            if hint:
+                st.info(hint)
 
     _render_history()
 
@@ -975,11 +982,23 @@ PAGES = {
 }
 
 
+def _warm_streamlit_secrets() -> None:
+    """Force ``st.secrets`` to parse so Cloud secrets promote to the runtime."""
+    fn = getattr(config, "streamlit_secrets_status", None)
+    if fn is not None:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> None:
     try:
         styles.inject()
     except Exception:  # noqa: BLE001
         pass
+
+    _warm_streamlit_secrets()
 
     fn = getattr(config, "ensure_storage_root", None)
     if fn is not None:

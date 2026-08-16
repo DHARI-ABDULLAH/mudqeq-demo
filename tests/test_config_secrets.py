@@ -13,6 +13,9 @@ class _FakeSecrets:
     def __init__(self, data: dict) -> None:
         self._data = data
 
+    def keys(self):
+        return self._data.keys()
+
     def __getitem__(self, key: str):
         if key not in self._data:
             raise KeyError(key)
@@ -126,3 +129,40 @@ def test_additional_nested_openai_paths(monkeypatch, path, expected):
 
     monkeypatch.setattr(st, "secrets", _FakeSecrets(nested))
     assert cfg.get_openai_api_key() == expected
+
+
+def test_secrets_section_wrapper_is_supported(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    import streamlit as st
+
+    monkeypatch.setattr(
+        st,
+        "secrets",
+        _FakeSecrets({"secrets": {"OPENAI_API_KEY": "wrapped-key"}}),
+    )
+    assert cfg.get_openai_api_key() == "wrapped-key"
+
+
+def test_openai_key_alias_is_supported(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_KEY", raising=False)
+    import streamlit as st
+
+    monkeypatch.setattr(st, "secrets", _FakeSecrets({"OPENAI_KEY": "alias-key"}))
+    assert cfg.get_openai_api_key() == "alias-key"
+
+
+def test_streamlit_secrets_status_lists_key_names_without_values(monkeypatch):
+    import streamlit as st
+
+    monkeypatch.setattr(
+        st,
+        "secrets",
+        _FakeSecrets({"GROQ_API_KEY": "old", "OPENAI_MODEL": "gpt-4o-mini"}),
+    )
+    status = cfg.streamlit_secrets_status()
+    assert status["loaded"] == "yes"
+    assert "GROQ_API_KEY" in status["key_names"]
+    assert "OPENAI_MODEL" in status["key_names"]
+    assert "old" not in status["key_names"]
+    assert "OPENAI_API_KEY" in status["hint"]
