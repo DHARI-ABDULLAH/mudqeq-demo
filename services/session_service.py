@@ -1,16 +1,23 @@
 """
 web_demo/services/session_service.py
 ------------------------------------
-Per-session isolation for the public demo.
+Per-session isolation for the public demo (MULTI-DOCUMENT).
 
 CRITICAL: every document/index/chat operation is keyed by a secret, random
 ``session_id``. A session's working files live only under::
 
     <DEMO_STORAGE_ROOT>/<session_id>/
+        <document_id>.pdf
+        <document_id>.faiss
+        <document_id>.chunks.json
 
 Because ``session_id`` is a cryptographically-random UUID that is kept only in
 the requesting browser's Streamlit session state, one visitor can never name,
 reach, or query another visitor's directory or in-memory record.
+
+Like the desktop app, a session can hold MULTIPLE documents (bounded by
+``MAX_FILES_PER_SESSION``). Each document has its own FAISS index and chunk
+file, addressed strictly by a validated ``document_id`` — never by filename.
 
 This module is pure Python (no Streamlit import) so isolation can be unit
 tested directly.
@@ -34,8 +41,10 @@ from config import (
 )
 from services import security
 
-INDEX_FILE = "index.faiss"
-CHUNKS_FILE = "chunks.json"
+STATUS_PROCESSING = "processing"
+STATUS_READY = "ready"
+STATUS_NEEDS_OCR = "needs_ocr"
+STATUS_ERROR = "error"
 
 
 @dataclass
@@ -44,7 +53,9 @@ class DocumentRecord:
     display_name: str
     num_pages: int = 0
     num_chunks: int = 0
-    status: str = "processing"  # processing | ready | needs_ocr | error
+    status: str = STATUS_PROCESSING  # processing | ready | needs_ocr | error
+    file_hash: str = ""
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -54,7 +65,7 @@ class SessionRecord:
     last_active: float = field(default_factory=time.time)
     uploads: int = 0
     questions: int = 0
-    document: Optional[DocumentRecord] = None
+    documents: dict[str, DocumentRecord] = field(default_factory=dict)
 
 
 _sessions: dict[str, SessionRecord] = {}
@@ -93,65 +104,109 @@ def session_dir(session_id: str) -> Path:
     return security.safe_child_path(DEMO_STORAGE_ROOT, session_id)
 
 
-def index_path(session_id: str) -> Path:
-    return security.safe_child_path(session_dir(session_id), INDEX_FILE)
-
-
-def chunks_path(session_id: str) -> Path:
-    return security.safe_child_path(session_dir(session_id), CHUNKS_FILE)
-
-
 def pdf_path(session_id: str, document_id: str) -> Path:
     security.require_valid_id(document_id)
     return security.safe_child_path(session_dir(session_id), f"{document_id}.pdf")
 
 
-# --- Document record ------------------------------------------------------
-def set_document(session_id: str, record: DocumentRecord) -> None:
+def index_path(session_id: str, document_id: str) -> Path:
+    security.require_valid_id(document_id)
+    return security.safe_child_path(session_dir(session_id), f"{document_id}.faiss")
+
+
+def chunks_path(session_id: str, document_id: str) -> Path:
+    security.require_valid_id(document_id)
+    return security.safe_child_path(
+        session_dir(session_id), f"{document_id}.chunks.json"
+    )
+
+
+# --- Document records -----------------------------------------------------
+def add_document(session_id: str, record: DocumentRecord) -> None:
+    """Register (or replace) a document record within this session."""
     with _lock:
         rec = get_or_create(session_id)
-        rec.document = record
+        rec.documents[record.document_id] = record
         rec.last_active = time.time()
+
+
+# Backwards-compatible alias.
+set_document = add_document
 
 
 def get_document(session_id: str, document_id: str) -> Optional[DocumentRecord]:
     """Return the document ONLY if it belongs to this exact session."""
     with _lock:
         rec = _sessions.get(session_id)
-        if rec is None or rec.document is None:
+        if rec is None:
             return None
-        if rec.document.document_id != document_id:
-            return None
-        return rec.document
+        return rec.documents.get(document_id)
 
 
-def current_document(session_id: str) -> Optional[DocumentRecord]:
+def has_document(session_id: str, document_id: str) -> bool:
+    return get_document(session_id, document_id) is not None
+
+
+def list_documents(session_id: str) -> list[DocumentRecord]:
+    """All documents in the session, newest first (any status)."""
     with _lock:
         rec = _sessions.get(session_id)
-        return rec.document if rec else None
+        if rec is None:
+            return []
+        docs = list(rec.documents.values())
+    docs.sort(key=lambda d: d.created_at, reverse=True)
+    return docs
 
 
-def clear_document(session_id: str) -> None:
-    """Delete the current document's files from disk and drop the record."""
+def ready_documents(session_id: str) -> list[DocumentRecord]:
+    """Only documents that finished indexing (usable in chat/search)."""
+    return [d for d in list_documents(session_id) if d.status == STATUS_READY]
+
+
+def find_by_hash(session_id: str, file_hash: str) -> Optional[DocumentRecord]:
+    if not file_hash:
+        return None
+    with _lock:
+        rec = _sessions.get(session_id)
+        if rec is None:
+            return None
+        for doc in rec.documents.values():
+            if doc.file_hash and doc.file_hash == file_hash:
+                return doc
+    return None
+
+
+def remove_document(session_id: str, document_id: str) -> None:
+    """Drop a document's record and delete its files from disk."""
     with _lock:
         rec = _sessions.get(session_id)
         if rec is not None:
-            rec.document = None
-    _delete_document_files(session_id)
+            rec.documents.pop(document_id, None)
+    _delete_document_files(session_id, document_id)
 
 
-def _delete_document_files(session_id: str) -> None:
-    d = session_dir(session_id)
-    if not d.exists():
+def _delete_document_files(session_id: str, document_id: str) -> None:
+    if not security.is_valid_id(document_id):
         return
-    for child in d.iterdir():
+    for path in (
+        pdf_path(session_id, document_id),
+        index_path(session_id, document_id),
+        chunks_path(session_id, document_id),
+    ):
         try:
-            if child.is_file() or child.is_symlink():
-                child.unlink(missing_ok=True)
-            else:
-                shutil.rmtree(child, ignore_errors=True)
+            path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# --- Stats (session-only; never global) -----------------------------------
+def stats(session_id: str) -> dict:
+    ready = ready_documents(session_id)
+    return {
+        "num_documents": len(ready),
+        "total_pages": sum(d.num_pages for d in ready),
+        "total_chunks": sum(d.num_chunks for d in ready),
+    }
 
 
 # --- Rate / quota gates ---------------------------------------------------
@@ -169,12 +224,15 @@ def record_upload(session_id: str) -> None:
         rec.uploads += 1
 
 
-def has_document_slot(session_id: str) -> bool:
-    """Enforce MAX_FILES_PER_SESSION (concurrent live documents)."""
+def live_document_count(session_id: str) -> int:
     with _lock:
         rec = _sessions.get(session_id)
-        live = 1 if (rec and rec.document is not None) else 0
-        return live < MAX_FILES_PER_SESSION
+        return len(rec.documents) if rec else 0
+
+
+def has_document_slot(session_id: str) -> bool:
+    """Enforce MAX_FILES_PER_SESSION (concurrent live documents)."""
+    return live_document_count(session_id) < MAX_FILES_PER_SESSION
 
 
 def can_ask(session_id: str) -> bool:

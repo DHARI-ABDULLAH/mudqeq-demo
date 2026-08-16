@@ -70,14 +70,16 @@ DEMO_STORAGE_ROOT = Path(
 MAX_FILE_SIZE_MB = _int_env("MAX_FILE_SIZE_MB", 10, minimum=1, maximum=50)
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 MAX_PAGES = _int_env("MAX_PAGES", 50, minimum=1, maximum=500)
-MAX_FILES_PER_SESSION = _int_env("MAX_FILES_PER_SESSION", 1, minimum=1, maximum=10)
+# The demo supports MULTIPLE documents per session (like the desktop app),
+# bounded to protect the shared public server.
+MAX_FILES_PER_SESSION = _int_env("MAX_FILES_PER_SESSION", 5, minimum=1, maximum=20)
 
 # --- Abuse / rate control -------------------------------------------------
 MAX_QUESTIONS_PER_SESSION = _int_env(
     "MAX_QUESTIONS_PER_SESSION", 20, minimum=1, maximum=1000
 )
 MAX_UPLOADS_PER_SESSION = _int_env(
-    "MAX_UPLOADS_PER_SESSION", 5, minimum=1, maximum=1000
+    "MAX_UPLOADS_PER_SESSION", 15, minimum=1, maximum=1000
 )
 
 # --- Session lifetime -----------------------------------------------------
@@ -85,6 +87,12 @@ SESSION_TTL_MINUTES = _int_env("SESSION_TTL_MINUTES", 30, minimum=1, maximum=144
 
 # --- RAG / retrieval ------------------------------------------------------
 TOP_K = _int_env("TOP_K", 4, minimum=1, maximum=10)
+# Bounds for the chat Top-K control (mirrors the desktop settings slider).
+TOP_K_MIN = _int_env("TOP_K_MIN", 2, minimum=1, maximum=10)
+TOP_K_MAX = _int_env("TOP_K_MAX", 10, minimum=TOP_K_MIN, maximum=20)
+# Search page has its own results control (independent of chat Top-K).
+SEARCH_DEFAULT_RESULTS = _int_env("SEARCH_DEFAULT_RESULTS", 8, minimum=1, maximum=50)
+SEARCH_MAX_RESULTS = _int_env("SEARCH_MAX_RESULTS", 20, minimum=1, maximum=100)
 MAX_RAG_CONTEXT_CHARS = _int_env(
     "MAX_RAG_CONTEXT_CHARS", 6000, minimum=500, maximum=30000
 )

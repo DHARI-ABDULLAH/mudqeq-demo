@@ -28,6 +28,36 @@ def test_retrieve_unknown_document_returns_empty(new_session):
     assert retrieval_service.retrieve(new_session, unknown, "anything") == []
 
 
+def test_multi_document_retrieval_merges_and_ranks(new_session):
+    d1 = make_pdf(["Murabaha is a cost-plus-profit sale contract in Islamic finance."])
+    d2 = make_pdf(["Ijarah is a leasing arrangement. Sukuk are asset-backed."])
+    r1 = document_service.ingest(new_session, d1, "murabaha.pdf")
+    r2 = document_service.ingest(new_session, d2, "ijarah.pdf")
+
+    # Query across BOTH documents (list of ids).
+    hits = retrieval_service.retrieve(
+        new_session, [r1.document_id, r2.document_id], "leasing arrangement", top_k=4
+    )
+    assert len(hits) >= 1
+    # The most relevant chunk should come from the leasing (ijarah) document.
+    assert hits[0]["document_name"] == "ijarah.pdf"
+    # Results are globally sorted by score (descending).
+    scores = [h["score"] for h in hits]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_retrieval_ignores_foreign_document_ids(new_session):
+    d1 = make_pdf(["Murabaha is a cost-plus-profit sale contract."])
+    r1 = document_service.ingest(new_session, d1, "own.pdf")
+    foreign = security.new_id()  # not owned by this session
+    hits = retrieval_service.retrieve(
+        new_session, [r1.document_id, foreign], "Murabaha", top_k=4
+    )
+    # Foreign id contributes nothing; only the owned doc is searched.
+    assert len(hits) >= 1
+    assert all(h["document_name"] == "own.pdf" for h in hits)
+
+
 def test_rag_context_length_bounded():
     huge = "x" * 100_000
     results = [{"text": huge, "page_start": 1, "page_end": 1}]

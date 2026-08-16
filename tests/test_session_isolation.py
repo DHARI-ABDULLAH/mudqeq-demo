@@ -72,28 +72,45 @@ def test_session_directories_are_separate():
     assert security.is_within(DEMO_STORAGE_ROOT, db)
 
 
-def test_replacing_document_deletes_previous(new_session):
-    r1 = _ingest(new_session)
+def test_multiple_documents_coexist(new_session):
+    d1 = make_pdf(["Murabaha is a cost plus profit sale contract."])
+    d2 = make_pdf(["Ijarah is a leasing arrangement in Islamic finance."])
+    r1 = document_service.ingest(new_session, d1, "a.pdf")
+    r2 = document_service.ingest(new_session, d2, "b.pdf")
+
+    assert r1.document_id != r2.document_id
+    docs = session_service.list_documents(new_session)
+    assert len(docs) == 2
+    assert session_service.pdf_path(new_session, r1.document_id).exists()
+    assert session_service.pdf_path(new_session, r2.document_id).exists()
+
+
+def test_duplicate_upload_rejected_within_session(new_session):
+    import pytest
+
+    data = make_pdf(["A single unique document body for dedup."])
+    document_service.ingest(new_session, data, "dup.pdf")
+    with pytest.raises(security.UploadRejected):
+        document_service.ingest(new_session, data, "dup.pdf")
+
+
+def test_explicit_delete_removes_only_that_document(new_session):
+    d1 = make_pdf(["Murabaha is a cost plus profit sale contract."])
+    d2 = make_pdf(["Ijarah is a leasing arrangement in Islamic finance."])
+    r1 = document_service.ingest(new_session, d1, "a.pdf")
+    r2 = document_service.ingest(new_session, d2, "b.pdf")
+
     p1 = session_service.pdf_path(new_session, r1.document_id)
-    assert p1.exists()
+    i1 = session_service.index_path(new_session, r1.document_id)
+    assert p1.exists() and i1.exists()
 
-    r2 = _ingest(new_session)  # replace
-    assert r2.document_id != r1.document_id
-    # Old PDF file must be gone.
-    assert not p1.exists()
-    # Only the new document is the current one.
-    cur = session_service.current_document(new_session)
-    assert cur is not None and cur.document_id == r2.document_id
+    document_service.delete_document(new_session, r1.document_id)
 
-
-def test_explicit_delete_removes_files(new_session):
-    r = _ingest(new_session)
-    sdir = session_service.session_dir(new_session)
-    assert any(sdir.iterdir())
-    document_service.delete_current(new_session)
-    assert session_service.current_document(new_session) is None
-    # Files removed from the session directory.
-    assert not any(sdir.iterdir())
+    # r1 is gone (record + files); r2 is untouched.
+    assert session_service.get_document(new_session, r1.document_id) is None
+    assert not p1.exists() and not i1.exists()
+    assert session_service.get_document(new_session, r2.document_id) is not None
+    assert session_service.pdf_path(new_session, r2.document_id).exists()
 
 
 def test_ttl_cleanup_removes_expired_session():

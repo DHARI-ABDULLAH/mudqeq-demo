@@ -71,32 +71,60 @@ def hero() -> None:
     )
 
 
-def session_dashboard(doc) -> None:
-    """Render SESSION-ONLY stats. No global/user statistics are shown."""
-    if doc is None:
-        name, pages, chunks, status_label = "—", "—", "—", "لا يوجد مستند"
-    else:
-        name = doc.display_name
-        pages = doc.num_pages
-        chunks = doc.num_chunks
-        status_label = {
-            "ready": "جاهز",
-            "processing": "قيد المعالجة",
-            "needs_ocr": "يحتاج OCR",
-            "error": "خطأ",
-        }.get(doc.status, doc.status)
+_STATUS_LABELS = {
+    "ready": "جاهز",
+    "processing": "قيد المعالجة",
+    "needs_ocr": "يحتاج OCR",
+    "error": "خطأ",
+}
 
+_STATUS_BADGE_CLASS = {
+    "ready": "badge-ready",
+    "processing": "badge-ocr",
+    "needs_ocr": "badge-ocr",
+    "error": "badge-error",
+}
+
+
+def status_badge(status: str) -> str:
+    """Return an HTML badge span for a document status."""
+    label = _STATUS_LABELS.get(status, status)
+    css = _STATUS_BADGE_CLASS.get(status, "badge-ocr")
+    return f'<span class="badge {css}">{_esc(label)}</span>'
+
+
+def dashboard(stats: dict, remaining_questions: int) -> None:
+    """Render SESSION-ONLY stats. No global/user statistics are shown."""
+    num_docs = stats.get("num_documents", 0)
+    total_pages = stats.get("total_pages", 0)
+    total_chunks = stats.get("total_chunks", 0)
     st.markdown(
         f"""
         <div class="stat-grid">
-          <div class="stat-card"><div class="stat-value">{_esc(pages)}</div>
-            <div class="stat-label">عدد الصفحات</div></div>
-          <div class="stat-card"><div class="stat-value">{_esc(chunks)}</div>
-            <div class="stat-label">عدد المقاطع</div></div>
-          <div class="stat-card"><div class="stat-value">{_esc(status_label)}</div>
-            <div class="stat-label">حالة المعالجة</div></div>
-          <div class="stat-card"><div class="stat-value" style="font-size:1.05rem;">{_esc(name)}</div>
-            <div class="stat-label">المستند الحالي</div></div>
+          <div class="stat-card"><div class="stat-value">{_esc(num_docs)}</div>
+            <div class="stat-label">عدد المستندات</div></div>
+          <div class="stat-card"><div class="stat-value">{total_pages:,}</div>
+            <div class="stat-label">إجمالي الصفحات</div></div>
+          <div class="stat-card"><div class="stat-value">{total_chunks:,}</div>
+            <div class="stat-label">إجمالي المقاطع</div></div>
+          <div class="stat-card"><div class="stat-value">{_esc(remaining_questions)}</div>
+            <div class="stat-label">الأسئلة المتبقية</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def document_card(doc) -> None:
+    """Render a single document card (accepts a DocumentRecord)."""
+    name = _esc(doc.display_name)
+    badge = status_badge(doc.status)
+    meta = f"{_esc(doc.num_pages)} صفحة · {_esc(doc.num_chunks)} مقطع"
+    st.markdown(
+        f"""
+        <div class="doc-card">
+          <div class="doc-title">{name} &nbsp; {badge}</div>
+          <div class="doc-meta">{meta}</div>
         </div>
         """,
         unsafe_allow_html=True,

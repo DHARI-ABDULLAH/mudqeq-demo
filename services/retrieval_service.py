@@ -1,27 +1,30 @@
 """
 web_demo/services/retrieval_service.py
 --------------------------------------
-Per-session FAISS retrieval for the public demo.
+Per-session, per-document FAISS retrieval for the public demo (MULTI-DOCUMENT).
 
 Isolation model
 ---------------
-- Each session's index (``index.faiss``) and chunk metadata (``chunks.json``)
-  live only under that session's directory.
-- The in-memory cache is keyed by ``session_id`` AND ``document_id``. A lookup
-  can only ever return data for the exact session that owns it.
+- Each document's index (``<document_id>.faiss``) and chunk metadata
+  (``<document_id>.chunks.json``) live only under that session's directory.
+- The in-memory cache is keyed by ``(session_id, document_id)``. A lookup can
+  only ever return data for the exact session that owns it.
+- Retrieval verifies EACH requested document belongs to the calling session
+  before touching its index — a session can never read another's document.
 - Chunks are stored/loaded as JSON — the demo never unpickles user data.
 
-FAISS: IndexFlatIP over L2-normalized embeddings == cosine similarity.
+Multi-document search: each selected document is queried independently, then
+results are merged and globally ranked by score (cosine similarity via
+IndexFlatIP over L2-normalized embeddings).
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from typing import Optional
+from typing import Optional, Union
 
 import faiss
-import numpy as np
 
 from config import TOP_K
 from services import embedding_service, session_service
@@ -33,7 +36,7 @@ _cache_lock = threading.Lock()
 
 
 def build_and_store(session_id: str, document_id: str, chunks: list[dict]) -> int:
-    """Embed chunks, build a FAISS index, and persist it to the session dir.
+    """Embed chunks, build a FAISS index, and persist it under the session dir.
 
     Returns the number of vectors indexed.
     """
@@ -48,8 +51,10 @@ def build_and_store(session_id: str, document_id: str, chunks: list[dict]) -> in
     if len(embeddings):
         index.add(embeddings)
 
-    faiss.write_index(index, str(session_service.index_path(session_id)))
-    with open(session_service.chunks_path(session_id), "w", encoding="utf-8") as f:
+    faiss.write_index(index, str(session_service.index_path(session_id, document_id)))
+    with open(
+        session_service.chunks_path(session_id, document_id), "w", encoding="utf-8"
+    ) as f:
         json.dump(chunks, f, ensure_ascii=False)
 
     with _cache_lock:
@@ -64,8 +69,8 @@ def _load(session_id: str, document_id: str) -> Optional[tuple]:
     if hit is not None:
         return hit
 
-    idx_path = session_service.index_path(session_id)
-    chk_path = session_service.chunks_path(session_id)
+    idx_path = session_service.index_path(session_id, document_id)
+    chk_path = session_service.chunks_path(session_id, document_id)
     if not (idx_path.exists() and chk_path.exists()):
         return None
 
@@ -78,17 +83,8 @@ def _load(session_id: str, document_id: str) -> Optional[tuple]:
     return index, chunks
 
 
-def retrieve(
-    session_id: str, document_id: str, query: str, top_k: int = TOP_K
-) -> list[dict]:
-    """Return up to ``top_k`` results for the given session+document only."""
-    require_valid_id(session_id)
-    require_valid_id(document_id)
-
-    # A session may only retrieve against the document it currently owns.
-    if session_service.get_document(session_id, document_id) is None:
-        return []
-
+def _search_one(session_id: str, document_id: str, q_emb, top_k: int) -> list[dict]:
+    """Search a single owned document. Assumes ownership already verified."""
     loaded = _load(session_id, document_id)
     if loaded is None:
         return []
@@ -96,16 +92,15 @@ def retrieve(
     if index.ntotal == 0:
         return []
 
-    q_emb = embedding_service.embed_query(query)
     k = min(max(1, top_k), index.ntotal)
     scores, idx = index.search(q_emb, k)
 
-    results: list[dict] = []
+    out: list[dict] = []
     for score, i in zip(scores[0], idx[0]):
         if i == -1 or i >= len(chunks):
             continue
         c = chunks[i]
-        results.append(
+        out.append(
             {
                 "score": float(score),
                 "document_name": c.get("document_name", ""),
@@ -114,8 +109,41 @@ def retrieve(
                 "text": c.get("text", ""),
             }
         )
-    results.sort(key=lambda r: r["score"], reverse=True)
-    return results[:top_k]
+    return out
+
+
+def retrieve(
+    session_id: str,
+    document_ids: Union[str, list[str]],
+    query: str,
+    top_k: int = TOP_K,
+) -> list[dict]:
+    """Return up to ``top_k`` results merged across the given owned documents.
+
+    ``document_ids`` may be a single id (str) or a list of ids. Only documents
+    that belong to ``session_id`` are searched; unknown/foreign ids are ignored.
+    """
+    require_valid_id(session_id)
+    if isinstance(document_ids, str):
+        document_ids = [document_ids]
+
+    # A session may only retrieve against documents it currently owns.
+    valid_ids = [
+        d
+        for d in document_ids
+        if session_service.get_document(session_id, d) is not None
+    ]
+    if not valid_ids:
+        return []
+
+    q_emb = embedding_service.embed_query(query)
+
+    merged: list[dict] = []
+    for doc_id in valid_ids:
+        merged.extend(_search_one(session_id, doc_id, q_emb, top_k))
+
+    merged.sort(key=lambda r: r["score"], reverse=True)
+    return merged[:top_k]
 
 
 def invalidate(session_id: str, document_id: str | None = None) -> None:
