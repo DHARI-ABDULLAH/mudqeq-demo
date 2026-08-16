@@ -25,7 +25,6 @@ from services import (
     cleanup_service,
     document_service,
     llm_service,
-    retrieval_service,
     security,
     session_service,
 )
@@ -238,7 +237,7 @@ def page_search() -> None:
         return
 
     with st.spinner("جاري البحث..."):
-        results = retrieval_service.retrieve(
+        results = compat.retrieve(
             _sid(), resolved, query.strip(), top_k=int(n_results)
         )
     if not results:
@@ -295,7 +294,7 @@ def page_chat() -> None:
 
     with st.chat_message("assistant"):
         with st.spinner("جاري البحث في المستندات..."):
-            results = retrieval_service.retrieve(
+            results = compat.retrieve(
                 _sid(), resolved, question, top_k=st.session_state["top_k"]
             )
         if not results:

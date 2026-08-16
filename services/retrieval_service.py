@@ -27,7 +27,7 @@ from typing import Optional, Union
 import faiss
 
 from config import TOP_K
-from services import embedding_service, session_service
+from services import embedding_service, security, session_service
 from services.security import require_valid_id
 
 # Cache key: (session_id, document_id) -> (faiss_index, chunks)
@@ -126,12 +126,17 @@ def retrieve(
     require_valid_id(session_id)
     if isinstance(document_ids, str):
         document_ids = [document_ids]
+    elif not isinstance(document_ids, (list, tuple)):
+        return []
+    else:
+        document_ids = list(document_ids)
 
     # A session may only retrieve against documents it currently owns.
     valid_ids = [
         d
         for d in document_ids
-        if session_service.get_document(session_id, d) is not None
+        if security.is_valid_id(d)
+        and session_service.get_document(session_id, d) is not None
     ]
     if not valid_ids:
         return []

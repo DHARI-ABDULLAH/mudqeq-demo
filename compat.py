@@ -10,10 +10,14 @@ let the app start and render even when optional APIs are missing.
 
 from __future__ import annotations
 
+import inspect
+
 import streamlit as st
 
-from services import document_service, session_service
+from services import document_service, retrieval_service, security, session_service
 from ui import components
+
+ALL_DOCS = "__all__"
 
 
 def live_document_count(session_id: str) -> int:
@@ -86,6 +90,50 @@ def delete_document(session_id: str, document_id: str) -> None:
         document_service.delete_current(session_id)
         return
     raise RuntimeError("No document delete API available")
+
+
+def _normalize_document_ids(document_ids) -> list[str]:
+    """Return only valid hex document ids (never ``__all__`` or other sentinels)."""
+    if isinstance(document_ids, str):
+        raw = [document_ids]
+    elif isinstance(document_ids, (list, tuple)):
+        raw = list(document_ids)
+    else:
+        return []
+    return [d for d in raw if d != ALL_DOCS and security.is_valid_id(d)]
+
+
+def retrieve(
+    session_id: str, document_ids, query: str, *, top_k: int
+) -> list[dict]:
+    """Retrieve across one or more documents — old and new retrieval_service APIs.
+
+    Older deploys expose ``retrieve(session_id, document_id: str, ...)`` and
+    crash with ``UploadRejected`` if a list is passed. Newer deploys accept a
+    list. This wrapper works with both.
+    """
+    ids = _normalize_document_ids(document_ids)
+    if not ids:
+        return []
+
+    fn = retrieval_service.retrieve
+    params = inspect.signature(fn).parameters
+
+    # New multi-document API (second parameter named document_ids).
+    if "document_ids" in params:
+        return fn(session_id, ids, query, top_k=top_k)
+
+    # Legacy single-document API — query each id and merge by score.
+    merged: list[dict] = []
+    for doc_id in ids:
+        try:
+            hits = fn(session_id, doc_id, query, top_k=top_k)
+        except security.UploadRejected:
+            continue
+        if hits:
+            merged.extend(hits)
+    merged.sort(key=lambda r: r.get("score", 0), reverse=True)
+    return merged[:top_k]
 
 
 def _current_document(session_id: str):
