@@ -388,6 +388,48 @@ def openai_config_diagnostics() -> dict[str, str]:
     }
 
 
+def bootstrap_streamlit_secrets() -> None:
+    """Promote ``st.secrets`` into ``os.environ`` early in the Streamlit runtime.
+
+    Streamlit Community Cloud injects secrets through ``st.secrets``. Promotion
+    to ``os.environ`` normally happens on first parse, but importing ``config``
+    inside cached modules can race that on hosted deploys. Calling this once
+    per script run (before any OpenAI check) makes Cloud secrets visible to
+    ``get_openai_api_key()`` reliably.
+    """
+    try:
+        import streamlit as st
+        from streamlit.errors import StreamlitSecretNotFoundError
+    except ImportError:
+        return
+
+    def _promote(name: str, raw: object) -> None:
+        if isinstance(raw, (str, int, float)):
+            text = str(raw).strip()
+            if text and not _env_non_empty(name):
+                os.environ[name] = text
+
+    try:
+        secrets = st.secrets
+        for top in secrets.keys():
+            try:
+                value = secrets[top]
+            except KeyError:
+                continue
+            if _is_secret_mapping(value):
+                for sub in value.keys():
+                    try:
+                        _promote(str(sub), value[sub])
+                    except KeyError:
+                        continue
+            else:
+                _promote(str(top), value)
+    except StreamlitSecretNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def streamlit_secrets_status() -> dict[str, str]:
     """Public wrapper for safe Streamlit secrets metadata."""
     return _streamlit_secrets_status()

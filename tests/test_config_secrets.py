@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import config as cfg
@@ -150,6 +152,21 @@ def test_openai_key_alias_is_supported(monkeypatch):
 
     monkeypatch.setattr(st, "secrets", _FakeSecrets({"OPENAI_KEY": "alias-key"}))
     assert cfg.get_openai_api_key() == "alias-key"
+
+
+def test_bootstrap_promotes_streamlit_secrets_into_environment(monkeypatch):
+    import streamlit as st
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        st,
+        "secrets",
+        _FakeSecrets({"OPENAI_API_KEY": "bootstrapped-key", "OPENAI_MODEL": "gpt-4o-mini"}),
+    )
+    cfg.bootstrap_streamlit_secrets()
+    assert os.environ.get("OPENAI_API_KEY") == "bootstrapped-key"
+    assert cfg.get_openai_api_key() == "bootstrapped-key"
+    assert cfg.openai_is_configured() is True
 
 
 def test_streamlit_secrets_status_lists_key_names_without_values(monkeypatch):

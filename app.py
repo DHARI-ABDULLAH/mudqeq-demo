@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 import re
 import sys
 import threading
@@ -69,6 +70,14 @@ def _reload_demo_modules_if_updated() -> None:
 _reload_demo_modules_if_updated()
 
 import config  # noqa: E402
+
+_bootstrap = getattr(config, "bootstrap_streamlit_secrets", None)
+if _bootstrap is not None:
+    try:
+        _bootstrap()
+    except Exception:  # noqa: BLE001
+        pass
+
 from core.logging_utils import log_event  # noqa: E402
 
 try:  # ``core.intent`` is newer than the first deploy; never break start-up.
@@ -758,12 +767,21 @@ def page_chat() -> None:
             "المحادثة غير مُهيأة حالياً في هذه النسخة التجريبية. "
             "يمكنك استخدام **البحث** الذي يعمل محلياً على الخادم."
         )
-        with st.expander("تشخيص إعداد OpenAI (آمن — بدون عرض المفتاح)"):
+        with st.expander(
+            "تشخيص إعداد OpenAI (آمن — بدون عرض المفتاح)",
+            expanded=True,
+        ):
             diag = _llm_diagnostics()
             st.json(diag)
             hint = diag.get("Configuration hint")
             if hint:
                 st.info(hint)
+        st.markdown(
+            "**لتفعيل المحادثة على Streamlit Cloud:**\n"
+            "1. App settings → **Secrets**\n"
+            "2. انسخ محتوى `.streamlit/secrets.toml.example` والصق مفتاحك\n"
+            "3. **Save** ثم **Reboot app**"
+        )
 
     _render_history()
 
@@ -984,10 +1002,16 @@ PAGES = {
 
 def _warm_streamlit_secrets() -> None:
     """Force ``st.secrets`` to parse so Cloud secrets promote to the runtime."""
-    fn = getattr(config, "streamlit_secrets_status", None)
+    fn = getattr(config, "bootstrap_streamlit_secrets", None)
     if fn is not None:
         try:
             fn()
+        except Exception:  # noqa: BLE001
+            pass
+    status_fn = getattr(config, "streamlit_secrets_status", None)
+    if status_fn is not None:
+        try:
+            status_fn()
         except Exception:  # noqa: BLE001
             pass
 
