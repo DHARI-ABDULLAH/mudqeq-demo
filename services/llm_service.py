@@ -48,7 +48,11 @@ ERR_EMPTY = "empty"
 
 _ARABIC_MESSAGES = {
     ERR_NOT_CONFIGURED: "خدمة الذكاء الاصطناعي غير مُهيأة حالياً في النسخة التجريبية.",
-    ERR_AUTH: "خدمة الذكاء الاصطناعي غير متاحة مؤقتاً. يرجى المحاولة لاحقاً.",
+    ERR_AUTH: (
+        "تعذّر التحقق من صلاحية الوصول إلى خدمة الذكاء الاصطناعي "
+        "(مشكلة في مفتاح الخدمة، وليست مشكلة في مستندك). "
+        "يرجى إبلاغ مشغّل النسخة التجريبية."
+    ),
     ERR_RATE_LIMIT: "تم الوصول مؤقتاً إلى حد استخدام النسخة التجريبية. يرجى المحاولة لاحقاً.",
     ERR_UPSTREAM: "خدمة الذكاء الاصطناعي غير متاحة مؤقتاً. يرجى المحاولة لاحقاً.",
     ERR_TIMEOUT: "استغرقت الخدمة وقتاً أطول من المتوقع. يرجى المحاولة مرة أخرى.",
@@ -120,13 +124,37 @@ def build_context(results: list[dict], max_chars: int = MAX_RAG_CONTEXT_CHARS) -
     return "\n\n---\n\n".join(parts)
 
 
-def build_messages(question: str, context: str) -> list[dict]:
+# Question modes. OVERVIEW receives ordered document-level context instead of
+# nearest-neighbour matches, so the task description has to change with it.
+MODE_FACTUAL = "factual"
+MODE_OVERVIEW = "overview"
+
+_TASK_FACTUAL = (
+    "بناءً على السياق أعلاه فقط، أجب عن السؤال التالي مع ذكر أرقام الصفحات:\n"
+    "السؤال: {question}"
+)
+
+_TASK_OVERVIEW = (
+    "المقاطع أعلاه مأخوذة من المستند بترتيب صفحاته.\n"
+    "بناءً عليها فقط، اكتب نظرة عامة منظّمة تتضمن:\n"
+    "- موضوع المستند الرئيسي.\n"
+    "- أبرز الأقسام أو المحاور التي يغطيها.\n"
+    "- أهم النقاط المذكورة.\n"
+    "اذكر أرقام الصفحات لكل نقطة. لا تضف أي معلومة غير موجودة في المقاطع، "
+    "وإذا كانت المقاطع جزئية فاذكر أنها تغطي جزءاً من المستند.\n"
+    "طلب المستخدم: {question}"
+)
+
+
+def build_messages(
+    question: str, context: str, mode: str = MODE_FACTUAL
+) -> list[dict]:
+    task = _TASK_OVERVIEW if mode == MODE_OVERVIEW else _TASK_FACTUAL
     user_content = (
         "=== سياق المستند غير الموثوق (ابدأ) ===\n"
         f"{context}\n"
         "=== سياق المستند غير الموثوق (انتهى) ===\n\n"
-        "بناءً على السياق أعلاه فقط، أجب عن السؤال التالي مع ذكر أرقام الصفحات:\n"
-        f"السؤال: {question}"
+        + task.format(question=question)
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -138,7 +166,12 @@ def _should_retry(status: int) -> bool:
     return status == 429 or 500 <= status < 600
 
 
-def answer(session_id: str, question: str, results: list[dict]) -> LLMResult:
+def answer(
+    session_id: str,
+    question: str,
+    results: list[dict],
+    mode: str = MODE_FACTUAL,
+) -> LLMResult:
     """Call Groq with the question + bounded context. Never raises for API
     errors — returns an LLMResult with an Arabic-safe category instead."""
     if not groq_is_configured():
@@ -146,7 +179,7 @@ def answer(session_id: str, question: str, results: list[dict]) -> LLMResult:
         return LLMResult(ok=False, error_category=ERR_NOT_CONFIGURED)
 
     context = build_context(results)
-    messages = build_messages(question, context)
+    messages = build_messages(question, context, mode=mode)
     api_key = get_groq_api_key()
     model = get_groq_model()
     payload = {

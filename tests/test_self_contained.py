@@ -1,0 +1,122 @@
+"""The demo must stand alone: no desktop backend, no Ollama, no path escapes.
+
+These guard the deployment contract for Streamlit Community Cloud, where only
+``web_demo/`` is published and nothing else exists on the host.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+WEB_DEMO_ROOT = Path(__file__).resolve().parent.parent
+
+# Only the shipped application is scanned. Test files are excluded because they
+# must be able to name the very things they forbid.
+SOURCE_FILES = [
+    p
+    for p in WEB_DEMO_ROOT.rglob("*.py")
+    if not {"__pycache__", ".git", "tests"} & set(p.parts)
+]
+
+
+def _strip_comments_and_docstrings(text: str) -> str:
+    text = re.sub(r'"""[\s\S]*?"""', "", text)
+    text = re.sub(r"'''[\s\S]*?'''", "", text)
+    return re.sub(r"#.*", "", text)
+
+
+@pytest.mark.parametrize("forbidden", ["8765", "11434", "127.0.0.1:", "localhost:"])
+def test_no_local_backend_endpoints(forbidden):
+    offenders = []
+    for path in SOURCE_FILES:
+        code = _strip_comments_and_docstrings(path.read_text(encoding="utf-8"))
+        if forbidden in code:
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
+    assert not offenders, f"{forbidden!r} referenced in: {offenders}"
+
+
+def test_no_ollama_runtime_dependency():
+    offenders = []
+    for path in SOURCE_FILES:
+        code = _strip_comments_and_docstrings(path.read_text(encoding="utf-8"))
+        if "ollama" in code.lower():
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
+    assert not offenders, f"Ollama referenced in code: {offenders}"
+
+
+def test_no_fastapi_or_uvicorn_dependency():
+    requirements = (WEB_DEMO_ROOT / "requirements.txt").read_text(encoding="utf-8").lower()
+    assert "fastapi" not in requirements
+    assert "uvicorn" not in requirements
+
+    offenders = []
+    for path in SOURCE_FILES:
+        code = _strip_comments_and_docstrings(path.read_text(encoding="utf-8")).lower()
+        if "import fastapi" in code or "from fastapi" in code:
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
+    assert not offenders
+
+
+def test_no_imports_from_the_desktop_application():
+    """web_demo must never import the desktop project's packages."""
+    banned = re.compile(
+        r"^\s*(?:from|import)\s+(?:\.\.|backend|desktop|api|src_tauri)\b", re.M
+    )
+    offenders = []
+    for path in SOURCE_FILES:
+        if banned.search(path.read_text(encoding="utf-8")):
+            offenders.append(str(path.relative_to(WEB_DEMO_ROOT)))
+    assert not offenders, f"desktop imports found in: {offenders}"
+
+
+def test_storage_root_is_ephemeral_and_outside_the_repo():
+    from config import DEMO_STORAGE_ROOT
+
+    resolved = DEMO_STORAGE_ROOT.resolve()
+    assert WEB_DEMO_ROOT.resolve() not in resolved.parents
+    assert resolved != WEB_DEMO_ROOT.resolve()
+
+
+def test_session_paths_cannot_escape_the_storage_root():
+    from config import DEMO_STORAGE_ROOT
+    from services import security, session_service
+
+    sid = security.new_id()
+    doc = security.new_id()
+    session_service.get_or_create(sid)
+    try:
+        for path in (
+            session_service.session_dir(sid),
+            session_service.pdf_path(sid, doc),
+            session_service.index_path(sid, doc),
+            session_service.chunks_path(sid, doc),
+        ):
+            assert security.is_within(DEMO_STORAGE_ROOT, path)
+
+        for evil in ["../escape", "..", "/etc/passwd", "a/../../b"]:
+            with pytest.raises(security.UploadRejected):
+                session_service.index_path(sid, evil)
+    finally:
+        session_service.destroy(sid)
+
+
+def test_llm_adapter_targets_groq_only():
+    from services import llm_service
+
+    source = (WEB_DEMO_ROOT / "services" / "llm_service.py").read_text(encoding="utf-8")
+    assert "api.groq.com" not in source, "base URL must come from config"
+    assert llm_service.GROQ_BASE_URL.startswith("https://")
+    assert "groq" in llm_service.GROQ_BASE_URL
+
+
+def test_no_api_key_literals_in_source():
+    key_like = re.compile(r"gsk_[A-Za-z0-9]{20,}")
+    offenders = [
+        str(p.relative_to(WEB_DEMO_ROOT))
+        for p in SOURCE_FILES
+        if key_like.search(p.read_text(encoding="utf-8"))
+    ]
+    assert not offenders, f"hardcoded API key in: {offenders}"

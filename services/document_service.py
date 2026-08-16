@@ -116,6 +116,19 @@ def ingest(session_id: str, file_bytes: bytes, original_name: str | None) -> Ing
                   error_category=type(exc).__name__)
         raise security.UploadRejected("تعذّر فهرسة المستند.") from exc
 
+    # A successful write is not proof the index is usable. Re-read it through
+    # the exact path Search/Chat will use, so a document can only ever reach
+    # "ready" if it is genuinely queryable.
+    try:
+        retrieval_service.verify_document_index(session_id, document_id)
+    except retrieval_service.IndexUnavailable as exc:
+        _fail(session_id, document_id)
+        log_event("ingest", session_id, status="verify_failed",
+                  error_category=exc.reason)
+        raise security.UploadRejected(
+            "تعذّر التحقق من فهرس المستند بعد المعالجة. يرجى إعادة رفع الملف."
+        ) from exc
+
     record = session_service.DocumentRecord(
         document_id=document_id,
         display_name=display_name,
@@ -157,6 +170,25 @@ def delete_document(session_id: str, document_id: str) -> None:
     session_service.remove_document(session_id, document_id)
     retrieval_service.invalidate(session_id, document_id)
     log_event("delete_document", session_id, status="ok")
+
+
+def diagnostics(session_id: str) -> list[dict]:
+    """Content-free health report for every document in the session.
+
+    Safe to render in the UI: no document text, no chunk text, no secrets.
+    """
+    security.require_valid_id(session_id)
+    out: list[dict] = []
+    for doc in session_service.list_documents(session_id):
+        entry = {
+            "document_id": doc.document_id,
+            "status": doc.status,
+            "num_pages": doc.num_pages,
+            "num_chunks": doc.num_chunks,
+        }
+        entry.update(retrieval_service.index_diagnostics(session_id, doc.document_id))
+        out.append(entry)
+    return out
 
 
 def max_pages() -> int:

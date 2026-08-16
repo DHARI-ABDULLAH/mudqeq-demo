@@ -70,6 +70,12 @@ _reload_demo_modules_if_updated()
 
 import config  # noqa: E402
 from core.logging_utils import log_event  # noqa: E402
+
+try:  # ``core.intent`` is newer than the first deploy; never break start-up.
+    from core import intent as _intent  # noqa: E402
+except Exception:  # noqa: BLE001
+    _intent = None
+
 from services import (  # noqa: E402
     cleanup_service,
     document_service,
@@ -78,6 +84,12 @@ from services import (  # noqa: E402
     security,
     session_service,
 )
+
+try:  # newer than the first deploy; never break start-up if absent
+    from services import chat_service  # noqa: E402
+except Exception:  # noqa: BLE001
+    chat_service = None
+
 from ui import components, styles  # noqa: E402
 
 st.set_page_config(
@@ -96,6 +108,18 @@ NAV = [
 
 ALL_DOCS = "__all__"
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+# Shown when the index itself is unreadable. Deliberately different from the
+# "no relevant content" answer — conflating the two sends users hunting through
+# a document that was never actually searched.
+INDEX_ERROR_MESSAGE = (
+    "تعذر الوصول إلى فهرس المستند. أعد رفع المستند أو أعد المحاولة."
+)
+NO_CONTENT_MESSAGE = "لم أجد في المستندات المحددة معلومات كافية للإجابة."
+
+
+class RetrievalUnavailable(Exception):
+    """The document index could not be read — not an empty result set."""
 
 
 # --- Defensive config accessors -------------------------------------------
@@ -241,37 +265,103 @@ def _delete_document(session_id: str, document_id: str) -> None:
 
 
 def _note_failure(where: str, exc: BaseException) -> None:
-    """Record the last internal failure so the diagnostics panel can show it."""
-    st.session_state["last_error"] = f"{where}: {type(exc).__name__}: {exc}"
+    """Record the last internal failure so the diagnostics panel can show it.
+
+    Stores the exception type and its short reason code only — never document
+    text, questions, or credentials.
+    """
+    reason = getattr(exc, "reason", None) or str(exc)[:120]
+    st.session_state["last_error"] = f"{where}: {type(exc).__name__}: {reason}"
+
+
+def _record_retrieval(selected: int, valid: int, found: int, error: str = "") -> None:
+    st.session_state["last_retrieval"] = {
+        "selected_document_count": selected,
+        "valid_document_count": valid,
+        "retrieved_results_count": found,
+        "error": error,
+    }
+
+
+def _selected_ids(document_ids) -> list[str]:
+    return [d for d in (document_ids or []) if d != ALL_DOCS and _is_valid_id(d)]
 
 
 def _retrieve(session_id: str, document_ids, query: str, top_k: int) -> list[dict]:
-    """Retrieve across documents, tolerating single-doc and multi-doc APIs."""
-    ids = [d for d in (document_ids or []) if d != ALL_DOCS and _is_valid_id(d)]
+    """Top-K semantic retrieval across the selected documents.
+
+    Raises :class:`RetrievalUnavailable` when the index cannot be read, so the
+    caller can report an infrastructure problem instead of "no information".
+    """
+    ids = _selected_ids(document_ids)
     if not ids:
-        _note_failure("retrieve", ValueError("no valid document ids selected"))
+        _record_retrieval(len(document_ids or []), 0, 0)
         return []
 
-    fn = getattr(retrieval_service, "retrieve", None)
-    if fn is None:
-        _note_failure("retrieve", AttributeError("retrieval_service.retrieve missing"))
-        return []
-
-    # Preferred: multi-document API (accepts a list of ids).
     try:
-        return list(fn(session_id, ids, query, top_k=top_k) or [])
-    except Exception as exc:  # noqa: BLE001 - older builds reject a list outright
-        _note_failure("retrieve(multi)", exc)
+        results = list(retrieval_service.retrieve(session_id, ids, query, top_k=top_k) or [])
+    except Exception as exc:  # noqa: BLE001 - surfaced, never silently emptied
+        _note_failure("retrieve", exc)
+        _record_retrieval(len(ids), len(ids), 0, error=type(exc).__name__)
+        raise RetrievalUnavailable(str(exc)) from exc
 
-    # Fallback: legacy single-document API — query each, then merge by score.
-    merged: list[dict] = []
-    for doc_id in ids:
-        try:
-            merged.extend(fn(session_id, doc_id, query, top_k=top_k) or [])
-        except Exception as exc:  # noqa: BLE001
-            _note_failure("retrieve(single)", exc)
-    merged.sort(key=lambda r: r.get("score", 0), reverse=True)
-    return merged[:top_k]
+    _record_retrieval(len(ids), len(ids), len(results))
+    return results
+
+
+def _document_context(session_id: str, document_ids) -> list[dict]:
+    """Ordered, bounded whole-document context for overview questions."""
+    ids = _selected_ids(document_ids)
+    if not ids:
+        _record_retrieval(len(document_ids or []), 0, 0)
+        return []
+
+    fn = getattr(retrieval_service, "document_context", None)
+    if fn is None:  # older module in memory — fall back to semantic retrieval
+        return _retrieve(session_id, ids, "ملخص المستند", top_k=_top_k_max())
+
+    try:
+        results = list(fn(session_id, ids) or [])
+    except Exception as exc:  # noqa: BLE001
+        _note_failure("document_context", exc)
+        _record_retrieval(len(ids), len(ids), 0, error=type(exc).__name__)
+        raise RetrievalUnavailable(str(exc)) from exc
+
+    _record_retrieval(len(ids), len(ids), len(results))
+    return results
+
+
+def _document_diagnostics(session_id: str) -> list[dict]:
+    """Per-document index health. Content-free and safe to render."""
+    fn = getattr(document_service, "diagnostics", None)
+    if fn is None:
+        return [
+            {"document_id": d.document_id, "status": d.status,
+             "num_pages": d.num_pages, "num_chunks": d.num_chunks}
+            for d in _list_documents(session_id)
+        ]
+    try:
+        return fn(session_id)
+    except Exception as exc:  # noqa: BLE001
+        _note_failure("diagnostics", exc)
+        return []
+
+
+def _classify(question: str) -> str:
+    if _intent is None:
+        return "factual"
+    try:
+        return _intent.classify(question)
+    except Exception:  # noqa: BLE001
+        return "factual"
+
+
+def _llm_answer(session_id: str, question: str, results: list[dict], mode: str):
+    """Call the LLM adapter, tolerating builds without the ``mode`` parameter."""
+    try:
+        return llm_service.answer(session_id, question, results, mode=mode)
+    except TypeError:
+        return llm_service.answer(session_id, question, results)
 
 
 def _capabilities() -> dict[str, bool]:
@@ -290,6 +380,14 @@ def _capabilities() -> dict[str, bool]:
             document_service, "delete_document"
         ),
         "retrieval_service.retrieve(multi-doc)": multi_doc,
+        "retrieval_service.document_context": hasattr(
+            retrieval_service, "document_context"
+        ),
+        "retrieval_service.verify_document_index": hasattr(
+            retrieval_service, "verify_document_index"
+        ),
+        "core.intent": _intent is not None,
+        "services.chat_service": chat_service is not None,
         "components.dashboard": hasattr(components, "dashboard"),
     }
 
@@ -566,8 +664,13 @@ def page_search() -> None:
         st.warning("يرجى اختيار مستند واحد على الأقل.")
         return
 
-    with st.spinner("جاري البحث..."):
-        results = _retrieve(_sid(), resolved, query.strip(), top_k=int(n_results))
+    try:
+        with st.spinner("جاري البحث..."):
+            results = _retrieve(_sid(), resolved, query.strip(), top_k=int(n_results))
+    except RetrievalUnavailable:
+        st.error(INDEX_ERROR_MESSAGE)
+        return
+
     if not results:
         st.warning("لا توجد نتائج مطابقة.")
         return
@@ -619,35 +722,93 @@ def page_chat() -> None:
     with st.chat_message("user"):
         st.markdown(question)
 
+    mode = _classify(question)
+    # Overview questions ("لخص المستند", "what is inside the pdf") read the
+    # document in page order; specific questions use Top-K retrieval.
+    spinner_text = (
+        "جاري قراءة المستندات..." if mode == "overview" else "جاري البحث في المستندات..."
+    )
+
     with st.chat_message("assistant"):
-        with st.spinner("جاري البحث في المستندات..."):
-            results = _retrieve(
-                _sid(), resolved, question, top_k=_clamp_top_k(st.session_state["top_k"])
-            )
-        if not results:
-            answer_text = "لم أجد في المستندات المحددة معلومات كافية للإجابة."
+        with st.spinner(spinner_text):
+            outcome = _chat_turn(question, resolved)
+
+        st.session_state["last_retrieval"] = outcome["diagnostics"]
+        answer_text = outcome["text"]
+        results = outcome["sources"]
+
+        if outcome["kind"] == "index_error":
+            st.error(answer_text)
+        else:
             st.markdown(answer_text)
-            st.session_state["messages"].append(
-                {"role": "assistant", "content": answer_text, "sources": []}
-            )
-            return
 
-        session_service.record_question(_sid())
-        with st.spinner("جاري توليد الإجابة..."):
-            try:
-                result = llm_service.answer(_sid(), question, results)
-                answer_text = result.user_message
-            except Exception:  # noqa: BLE001 - never leak internals
-                answer_text = "تعذّر إنتاج الإجابة حالياً. يرجى المحاولة مرة أخرى."
-
-        st.markdown(answer_text)
-        with st.expander("عرض المقاطع المستخدمة"):
-            for s in results:
-                _render_source(s)
+        if results:
+            with st.expander("عرض المقاطع المستخدمة"):
+                for s in results:
+                    _render_source(s)
 
     st.session_state["messages"].append(
         {"role": "assistant", "content": answer_text, "sources": results}
     )
+
+
+def _chat_turn(question: str, resolved: list[str]) -> dict:
+    """Run one turn via chat_service, falling back to inline logic if absent."""
+    fn = getattr(chat_service, "respond", None) if chat_service else None
+    if fn is not None:
+        try:
+            outcome = fn(
+                _sid(),
+                question,
+                resolved,
+                top_k=_clamp_top_k(st.session_state["top_k"]),
+            )
+            if outcome.error_reason:
+                st.session_state["last_error"] = f"chat: {outcome.error_reason}"
+            return {
+                "kind": outcome.kind,
+                "text": outcome.text,
+                "sources": outcome.sources,
+                "diagnostics": outcome.diagnostics,
+            }
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("chat_service", exc)
+
+    mode = _classify(question)
+    try:
+        if mode == "overview":
+            results = _document_context(_sid(), resolved)
+        else:
+            results = _retrieve(
+                _sid(), resolved, question, top_k=_clamp_top_k(st.session_state["top_k"])
+            )
+    except RetrievalUnavailable:
+        return {
+            "kind": "index_error",
+            "text": INDEX_ERROR_MESSAGE,
+            "sources": [],
+            "diagnostics": st.session_state.get("last_retrieval", {}),
+        }
+
+    if not results:
+        return {
+            "kind": "no_content",
+            "text": NO_CONTENT_MESSAGE,
+            "sources": [],
+            "diagnostics": st.session_state.get("last_retrieval", {}),
+        }
+
+    session_service.record_question(_sid())
+    try:
+        text = _llm_answer(_sid(), question, results, mode).user_message
+    except Exception:  # noqa: BLE001 - never leak internals
+        text = "تعذّر إنتاج الإجابة حالياً. يرجى المحاولة مرة أخرى."
+    return {
+        "kind": "answer",
+        "text": text,
+        "sources": results,
+        "diagnostics": st.session_state.get("last_retrieval", {}),
+    }
 
 
 def _render_history() -> None:
@@ -713,6 +874,15 @@ def page_about() -> None:
                 "بعض الوحدات قديمة في ذاكرة الخادم. أعد تشغيل التطبيق "
                 "(Reboot app) لتحميل أحدث نسخة."
             )
+
+        st.caption("حالة فهارس مستندات هذه الجلسة (بدون أي محتوى):")
+        st.json(_document_diagnostics(_sid()))
+
+        last_retrieval = st.session_state.get("last_retrieval")
+        if last_retrieval:
+            st.caption("آخر عملية استرجاع:")
+            st.json(last_retrieval)
+
         last_error = st.session_state.get("last_error")
         if last_error:
             st.caption("آخر خطأ داخلي:")
