@@ -116,6 +116,33 @@ MAX_EXTRACTED_CHARS = _int_env(
 )
 MAX_CHUNKS = _int_env("MAX_CHUNKS", 4000, minimum=10, maximum=50_000)
 
+# --- Case Analysis ("تحليل حالة") ----------------------------------------
+# A case analysis is a multi-step pipeline (understand -> plan -> retrieve ->
+# evidence -> solutions -> report). Every stage is hard-bounded so a single
+# case can never fan out into unbounded retrieval or provider spend.
+MAX_CASE_CHARS = _int_env("MAX_CASE_CHARS", 6000, minimum=100, maximum=20_000)
+MAX_CASE_RESEARCH_QUERIES = _int_env(
+    "MAX_CASE_RESEARCH_QUERIES", 6, minimum=1, maximum=10
+)
+MIN_CASE_RESEARCH_QUERIES = _int_env(
+    "MIN_CASE_RESEARCH_QUERIES", 3, minimum=1, maximum=MAX_CASE_RESEARCH_QUERIES
+)
+MAX_RESULTS_PER_QUERY = _int_env("MAX_RESULTS_PER_QUERY", 5, minimum=1, maximum=20)
+MAX_TOTAL_EVIDENCE_CHUNKS = _int_env(
+    "MAX_TOTAL_EVIDENCE_CHUNKS", 18, minimum=1, maximum=60
+)
+MAX_CASE_CONTEXT_CHARS = _int_env(
+    "MAX_CASE_CONTEXT_CHARS", 14_000, minimum=1_000, maximum=60_000
+)
+# Worst case per successful analysis: understand + plan + solutions + report.
+MAX_CASE_LLM_CALLS = _int_env("MAX_CASE_LLM_CALLS", 4, minimum=1, maximum=8)
+# Case analysis costs far more than one chat question, so it has its own quota
+# instead of silently draining MAX_QUESTIONS_PER_SESSION.
+MAX_CASES_PER_SESSION = _int_env("MAX_CASES_PER_SESSION", 3, minimum=1, maximum=50)
+MAX_CASE_FOLLOWUPS_PER_CASE = _int_env(
+    "MAX_CASE_FOLLOWUPS_PER_CASE", 5, minimum=1, maximum=20
+)
+
 
 def upload_limits_caption_ar() -> str:
     """Arabic upload hint for the UI — always matches server-side validation."""

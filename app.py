@@ -99,6 +99,13 @@ try:  # newer than the first deploy; never break start-up if absent
 except Exception:  # noqa: BLE001
     chat_service = None
 
+try:  # "تحليل حالة" ships after the first deploy; keep start-up resilient.
+    from core import case_models  # noqa: E402
+    from services import case_analysis_service  # noqa: E402
+except Exception:  # noqa: BLE001
+    case_analysis_service = None
+    case_models = None
+
 from ui import components, styles  # noqa: E402
 
 st.set_page_config(
@@ -116,6 +123,7 @@ except Exception:  # noqa: BLE001
 
 NAV = [
     ("chat", "المحادثة"),
+    ("case", "تحليل حالة"),
     ("documents", "المستندات"),
     ("search", "البحث"),
     ("about", "حول النسخة التجريبية"),
@@ -280,6 +288,16 @@ def _remaining_questions(session_id: str) -> int:
         return 0
 
 
+def _remaining_cases(session_id: str) -> int:
+    fn = getattr(session_service, "remaining_cases", None)
+    if fn is None:
+        return 0
+    try:
+        return int(fn(session_id))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _delete_document(session_id: str, document_id: str) -> None:
     fn = getattr(document_service, "delete_document", None)
     if fn is not None:
@@ -420,6 +438,11 @@ def _capabilities() -> dict[str, bool]:
             chat_service, "KIND_PROVIDER_ERROR"
         ),
         "config.openai_is_configured": hasattr(config, "openai_is_configured"),
+        "services.case_analysis_service": case_analysis_service is not None,
+        "llm_service.complete_json": hasattr(llm_service, "complete_json"),
+        "session_service.remaining_cases": hasattr(
+            session_service, "remaining_cases"
+        ),
         "llm_service(OpenAI)": getattr(llm_service, "PROVIDER_NAME", "") == "OpenAI",
         "components.dashboard": hasattr(components, "dashboard"),
     }
@@ -563,6 +586,11 @@ def _init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("top_k", _top_k_default())
     st.session_state.setdefault("confirm_delete", None)
+    # Case analysis ("تحليل حالة") state — kept separate from chat history.
+    st.session_state.setdefault("case_outcome", None)
+    st.session_state.setdefault("case_state", None)
+    st.session_state.setdefault("case_followups", [])
+    st.session_state.setdefault("case_extra_answers", "")
     session_service.get_or_create(st.session_state["session_id"])
 
 
@@ -587,6 +615,10 @@ def _sidebar() -> None:
             st.markdown(f'<div class="{css}">', unsafe_allow_html=True)
             if st.button(label, key=f"nav_{key}"):
                 st.session_state["page"] = key
+                # Keep the chat/case toggle in step with sidebar navigation so
+                # it never shows a mode the user is not actually on.
+                if key in {k for k, _ in _MODE_PAGES}:
+                    st.session_state["interaction_mode"] = key
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -605,6 +637,8 @@ def _sidebar() -> None:
             )
 
         st.caption(f"الأسئلة المتبقية في الجلسة: {_remaining_questions(_sid())}")
+        if case_analysis_service is not None:
+            st.caption(f"تحليلات الحالة المتبقية: {_remaining_cases(_sid())}")
         fn = _ui("sidebar_privacy")
         if fn is not None:
             try:
@@ -632,6 +666,39 @@ def _document_selector(ready_docs: list, key: str) -> list[str]:
     if ALL_DOCS in selection or not selection:
         return list(id_to_name.keys())
     return [s for s in selection if s in id_to_name]
+
+
+_MODE_PAGES = [("chat", "سؤال عن المستند"), ("case", "تحليل حالة")]
+
+
+def _apply_mode_choice() -> None:
+    st.session_state["page"] = st.session_state.get("interaction_mode", "chat")
+
+
+def _mode_selector(current: str) -> None:
+    """Explicit choice between a direct question and a full case analysis.
+
+    Deliberately a user-facing switch rather than automatic intent detection:
+    a case analysis costs far more than a chat turn, so the user decides.
+
+    Navigation happens in the widget's ``on_change`` callback. Comparing the
+    returned value against ``current`` instead would fight Streamlit's widget
+    state — the key already holds the previous page's mode on the first render
+    of the new page, which would bounce the user back and forth forever.
+    """
+    if case_analysis_service is None:
+        return
+    keys = [key for key, _ in _MODE_PAGES]
+    labels = dict(_MODE_PAGES)
+    st.radio(
+        "نوع الطلب",
+        keys,
+        index=keys.index(current) if current in keys else 0,
+        format_func=lambda k: labels.get(k, k),
+        horizontal=True,
+        key="interaction_mode",
+        on_change=_apply_mode_choice,
+    )
 
 
 # --- Pages ----------------------------------------------------------------
@@ -769,6 +836,8 @@ def page_chat() -> None:
     if not ready:
         _no_documents_notice()
         return
+
+    _mode_selector("chat")
 
     resolved = _document_selector(ready, key="chat_doc_selector")
 
@@ -936,6 +1005,237 @@ def _render_history() -> None:
                         _render_source(s)
 
 
+# --- Case analysis ("تحليل حالة") -----------------------------------------
+CASE_PLACEHOLDER_AR = (
+    "اكتب تفاصيل الحالة كاملة، بما في ذلك الأطراف والوقائع والشروط وأي معلومات "
+    "تعتقد أنها مهمة..."
+)
+
+
+def _case_progress(placeholder):
+    """High-level stage progress only — never the model's internal reasoning."""
+    stages = list(getattr(case_analysis_service, "STAGE_ORDER", ()))
+    labels = dict(getattr(case_analysis_service, "STAGE_LABELS_AR", {}))
+
+    def render(stage: str, label: str) -> None:
+        if not stages:
+            placeholder.info(f"⏳ {label}")
+            return
+        current = stages.index(stage) if stage in stages else 0
+        lines = []
+        for index, key in enumerate(stages):
+            mark = "✅" if index < current else ("⏳" if index == current else "◻️")
+            lines.append(f"{mark} {index + 1}. {labels.get(key, key)}")
+        placeholder.markdown("  \n".join(lines))
+
+    return render
+
+
+def _render_case_evidence(evidence: list) -> None:
+    """Show the chunks the analysis actually used, with their provenance."""
+    labels = dict(getattr(case_models, "STRENGTH_LABELS_AR", {}))
+    for item in evidence:
+        strength = labels.get(getattr(item, "strength", ""), "")
+        header = f"`{item.ref}` · {item.citation_ar()}"
+        if strength:
+            header += f" · {strength}"
+        with st.expander(header):
+            queries = getattr(item, "queries", [])
+            if queries:
+                st.caption("عُثر عليه عبر: " + " ، ".join(queries))
+            st.text((item.text or "")[:900])
+
+
+def _render_case_outcome(outcome) -> None:
+    kind = outcome.kind
+    service = case_analysis_service
+
+    if kind == service.KIND_REPORT:
+        st.markdown(outcome.report_markdown or outcome.text)
+
+        if outcome.citations:
+            st.caption(f"عدد المصادر المستشهد بها: {len(outcome.citations)}")
+        if outcome.evidence:
+            with st.expander(f"الأدلة المستخدمة ({len(outcome.evidence)} مقطع)"):
+                _render_case_evidence(outcome.evidence)
+        if outcome.queries:
+            with st.expander("نقاط البحث التي استُخدمت"):
+                for index, query in enumerate(outcome.queries, start=1):
+                    purpose = f" — {query.purpose}" if query.purpose else ""
+                    st.markdown(f"{index}. {query.text}{purpose}")
+        return
+
+    if kind == service.KIND_NEEDS_INFO:
+        st.warning(service.NEEDS_INFO_MESSAGE)
+        for index, missing in enumerate(outcome.missing_information, start=1):
+            reason = f" — {missing.reason}" if missing.reason else ""
+            st.markdown(f"{index}. {missing.question}{reason}")
+        return
+
+    if kind in (service.KIND_INDEX_ERROR, service.KIND_PROVIDER_ERROR):
+        st.error(outcome.text)
+        return
+
+    st.warning(outcome.text)
+
+
+def _run_case_analysis(case_text: str, resolved: list, *, force: bool) -> None:
+    placeholder = st.empty()
+    try:
+        outcome = case_analysis_service.analyze(
+            _sid(),
+            case_text,
+            resolved,
+            additional_answers=st.session_state.get("case_extra_answers", ""),
+            force_incomplete=force,
+            progress=_case_progress(placeholder),
+        )
+    except Exception as exc:  # noqa: BLE001 - never leak internals
+        placeholder.empty()
+        _note_failure("case_analysis", exc)
+        st.error(
+            "تعذّر إكمال تحليل الحالة حالياً. يرجى المحاولة مرة أخرى. "
+            "لم يُستهلك أي تحليل من رصيدك."
+        )
+        return
+
+    placeholder.empty()
+    st.session_state["case_outcome"] = outcome
+    st.session_state["case_state"] = outcome.state
+    st.session_state["case_followups"] = []
+    if outcome.diagnostics:
+        st.session_state["last_case_diagnostics"] = outcome.diagnostics
+    if outcome.error_reason:
+        st.session_state["last_error"] = f"case: {outcome.error_reason}"
+    st.rerun()
+
+
+def page_case() -> None:
+    _page_header(
+        "تحليل حالة",
+        "اكتب مشكلة واقعية كاملة، ويقوم النظام بتحليلها والبحث عنها في مستنداتك.",
+    )
+    if case_analysis_service is None:
+        st.warning(
+            "ميزة تحليل الحالة غير متاحة في هذه النسخة المحمّلة على الخادم. "
+            "أعد تشغيل التطبيق (Reboot app)."
+        )
+        return
+
+    _mode_selector("case")
+
+    ready = _ready_documents(_sid())
+    if not ready:
+        _no_documents_notice()
+        return
+
+    resolved = _document_selector(ready, key="case_doc_selector")
+
+    configured = _llm_is_configured()
+    if not configured:
+        st.warning(
+            "تحليل الحالة يحتاج إلى نموذج الذكاء الاصطناعي وهو غير مُهيأ حالياً. "
+            "يمكنك استخدام **البحث** الذي يعمل محلياً على الخادم."
+        )
+
+    remaining = _remaining_cases(_sid())
+    st.caption(f"تحليلات الحالة المتبقية في هذه الجلسة: {remaining}")
+    if remaining <= 0:
+        st.error(case_analysis_service.QUOTA_MESSAGE)
+
+    case_text = st.text_area(
+        "تفاصيل الحالة أو المشكلة",
+        placeholder=CASE_PLACEHOLDER_AR,
+        height=220,
+        max_chars=_cfg_int("MAX_CASE_CHARS", 6000),
+        key="case_text",
+    )
+
+    disabled = remaining <= 0 or not configured
+    col_run, col_clear = st.columns([1, 1])
+    run = col_run.button("تحليل الحالة", type="primary", disabled=disabled)
+    if col_clear.button("حالة جديدة"):
+        st.session_state["case_outcome"] = None
+        st.session_state["case_state"] = None
+        st.session_state["case_followups"] = []
+        st.session_state["case_extra_answers"] = ""
+        st.rerun()
+
+    if run:
+        if not resolved:
+            st.warning("يرجى اختيار مستند واحد على الأقل قبل تحليل الحالة.")
+        elif not (case_text or "").strip():
+            st.warning(case_analysis_service.NO_CASE_TEXT_MESSAGE)
+        else:
+            _run_case_analysis(case_text, resolved, force=False)
+
+    outcome = st.session_state.get("case_outcome")
+    if outcome is None:
+        return
+
+    st.markdown("---")
+    _render_case_outcome(outcome)
+
+    if outcome.kind == case_analysis_service.KIND_NEEDS_INFO:
+        _render_missing_info_form(case_text, resolved)
+        return
+
+    if outcome.kind == case_analysis_service.KIND_REPORT:
+        _render_case_followup()
+
+
+def _render_missing_info_form(case_text: str, resolved: list) -> None:
+    st.text_area(
+        "إجاباتك على الأسئلة أعلاه (اختياري)",
+        key="case_extra_answers",
+        height=140,
+    )
+    col_again, col_force = st.columns([1, 1])
+    if col_again.button("متابعة التحليل بالمعلومات الجديدة", type="primary"):
+        if resolved and (case_text or "").strip():
+            _run_case_analysis(case_text, resolved, force=False)
+    if col_force.button("أكمل التحليل رغم نقص المعلومات"):
+        if resolved and (case_text or "").strip():
+            _run_case_analysis(case_text, resolved, force=True)
+
+
+def _render_case_followup() -> None:
+    st.markdown("### أسئلة متابعة على هذه الحالة")
+    for entry in st.session_state.get("case_followups", []):
+        with st.chat_message("user"):
+            st.markdown(entry["question"])
+        with st.chat_message("assistant"):
+            st.markdown(entry["answer"])
+
+    max_followups = _cfg_int("MAX_CASE_FOLLOWUPS_PER_CASE", 5)
+    used = len(st.session_state.get("case_followups", []))
+    if used >= max_followups:
+        st.caption("تم الوصول إلى حد أسئلة المتابعة لهذه الحالة.")
+        return
+
+    question = st.chat_input("اسأل عن هذا التحليل...", key="case_followup_input")
+    if not question:
+        return
+
+    state = st.session_state.get("case_state")
+    with st.spinner("جاري إعداد الإجابة..."):
+        try:
+            result = case_analysis_service.follow_up(_sid(), state, question.strip())
+        except Exception as exc:  # noqa: BLE001
+            _note_failure("case_followup", exc)
+            st.error("تعذّر إنتاج الإجابة حالياً. يرجى المحاولة مرة أخرى.")
+            return
+
+    if not result.ok:
+        st.error(result.text)
+        return
+
+    st.session_state["case_followups"].append(
+        {"question": question.strip(), "answer": result.text}
+    )
+    st.rerun()
+
+
 def page_about() -> None:
     fn = _ui("hero")
     if fn is not None:
@@ -968,6 +1268,7 @@ def page_about() -> None:
 - الحد الأقصى للصفحات: {_cfg_int('MAX_PAGES', 200)} صفحة لكل ملف.
 - عدد المستندات في الجلسة: {_max_files_per_session()}.
 - الحد الأقصى للأسئلة في الجلسة: {_cfg_int('MAX_QUESTIONS_PER_SESSION', 20)}.
+- الحد الأقصى لتحليلات الحالة في الجلسة: {_cfg_int('MAX_CASES_PER_SESSION', 3)}.
 - مدة الجلسة قبل الحذف التلقائي: {_cfg_int('SESSION_TTL_MINUTES', 30)} دقيقة.
 
 ### مزوّد النموذج
@@ -1011,6 +1312,7 @@ def page_about() -> None:
 PAGES = {
     "documents": page_documents,
     "chat": page_chat,
+    "case": page_case,
     "search": page_search,
     "about": page_about,
 }
