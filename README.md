@@ -40,8 +40,41 @@ page works entirely on the server with **no external LLM call**.
 | App start | Hugging Face (only if model NOT baked in image) | Model files (no user data) |
 | Upload / Extract / Index / **Search** | none | none leaves the server |
 | **Chat** | OpenAI API (`api.openai.com`) | Question + minimum Top-K retrieved chunks + page numbers |
+| **Case analysis** | OpenAI API (`api.openai.com`) | Case description + structured case + bounded retrieved evidence + page numbers |
 
 The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
+
+---
+
+## Case analysis — "تحليل حالة"
+
+A second, explicitly-chosen mode for a full real-world problem rather than a
+single lookup. It layers on top of the existing RAG stack; chat, overview, and
+search keep their own code paths unchanged.
+
+```
+case text
+  → understand        (structured case: parties, facts, issues, gaps)
+  → missing-info gate (stops and asks when something critical is absent)
+  → plan research     (3–6 focused queries: rule / conditions / exceptions /
+                       procedure / consequences / limits)
+  → multi-step FAISS  (each query searched independently, selected docs only)
+  → evidence curation (de-duplicate, merge queries, rank, label strength)
+  → candidate solutions (each tied to evidence refs)
+  → grounded Arabic report + citations resolved back to real chunks
+```
+
+| Concern | How it is handled |
+|---------|-------------------|
+| Cost | 4 provider calls max per analysis, 1 per follow-up; every stage bounded by `MAX_CASE_*` |
+| Grounding | Conclusions must cite `E#` refs; unresolvable refs are dropped, not rendered |
+| Conflicts | Restricting/contradicting texts are carried into the report, never silently dropped |
+| Confidence | Qualitative (`قوية` / `متوسطة` / `محدودة`) computed from evidence counters — never a fabricated percentage |
+| Quota | Separate `MAX_CASES_PER_SESSION` counter, charged only after a complete report |
+| Injection | Document text *and* the user's case are fenced as untrusted data in every prompt |
+
+Implementation: `core/case_models.py`, `services/case_analysis_service.py`,
+`services/query_planner_service.py`, `services/evidence_service.py`.
 
 ---
 
@@ -56,8 +89,8 @@ The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 | `OPENAI_TIMEOUT_SECONDS` | No | `60` | Per-request timeout |
 | `OPENAI_MAX_RETRIES` | No | `1` | Transient 5xx/network only — **never** rate limits |
 | `OPENAI_BASE_URL` | No | — | Override endpoint (Azure/proxy) |
-| `MAX_FILE_SIZE_MB` | No | `10` | Max upload size |
-| `MAX_PAGES` | No | `50` | Max pages per PDF |
+| `MAX_FILE_SIZE_MB` | No | `50` | Max upload size |
+| `MAX_PAGES` | No | `200` | Max pages per PDF |
 | `MAX_FILES_PER_SESSION` | No | `1` | Live documents per session |
 | `MAX_QUESTIONS_PER_SESSION` | No | `20` | Chat quota per session |
 | `MAX_UPLOADS_PER_SESSION` | No | `5` | Upload attempts per session |
@@ -65,6 +98,14 @@ The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
 | `TOP_K` | No | `4` | Retrieved chunks |
 | `MAX_RAG_CONTEXT_CHARS` | No | `6000` | Context sent to LLM |
 | `DEMO_STORAGE_ROOT` | No | `/tmp/mudqeq_demo` | Ephemeral storage root |
+| `MAX_CASE_CHARS` | No | `6000` | Max case description length |
+| `MAX_CASE_RESEARCH_QUERIES` | No | `6` | Research queries per case |
+| `MAX_RESULTS_PER_QUERY` | No | `5` | Chunks retrieved per research query |
+| `MAX_TOTAL_EVIDENCE_CHUNKS` | No | `18` | Evidence kept after de-duplication |
+| `MAX_CASE_CONTEXT_CHARS` | No | `14000` | Evidence context sent per case call |
+| `MAX_CASE_LLM_CALLS` | No | `4` | Provider calls per successful analysis |
+| `MAX_CASES_PER_SESSION` | No | `3` | Case-analysis quota per session |
+| `MAX_CASE_FOLLOWUPS_PER_CASE` | No | `5` | Follow-up questions per case |
 
 **Never** put `OPENAI_API_KEY` in source, git, or README — only:
 - **Local:** `web_demo/.env` (gitignored)

@@ -34,6 +34,7 @@ from typing import Optional
 
 from config import (
     DEMO_STORAGE_ROOT,
+    MAX_CASES_PER_SESSION,
     MAX_FILES_PER_SESSION,
     MAX_QUESTIONS_PER_SESSION,
     MAX_UPLOADS_PER_SESSION,
@@ -65,6 +66,9 @@ class SessionRecord:
     last_active: float = field(default_factory=time.time)
     uploads: int = 0
     questions: int = 0
+    # Case analyses are a separate, much more expensive operation, so they are
+    # metered on their own counter instead of draining the question quota.
+    cases: int = 0
     documents: dict[str, DocumentRecord] = field(default_factory=dict)
 
 
@@ -254,6 +258,29 @@ def remaining_questions(session_id: str) -> int:
         rec = _sessions.get(session_id)
         used = rec.questions if rec else 0
         return max(0, MAX_QUESTIONS_PER_SESSION - used)
+
+
+# --- Case analysis quota (separate from the question quota) ---------------
+def can_analyze_case(session_id: str) -> bool:
+    with _lock:
+        rec = _sessions.get(session_id)
+        if rec is None:
+            return True
+        return rec.cases < MAX_CASES_PER_SESSION
+
+
+def record_case(session_id: str) -> None:
+    """Charge one case operation. Called ONLY after a full report succeeded."""
+    with _lock:
+        rec = get_or_create(session_id)
+        rec.cases += 1
+
+
+def remaining_cases(session_id: str) -> int:
+    with _lock:
+        rec = _sessions.get(session_id)
+        used = rec.cases if rec else 0
+        return max(0, MAX_CASES_PER_SESSION - used)
 
 
 # --- Teardown -------------------------------------------------------------

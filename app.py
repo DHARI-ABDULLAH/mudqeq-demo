@@ -102,9 +102,12 @@ except Exception:  # noqa: BLE001
 try:  # "تحليل حالة" ships after the first deploy; keep start-up resilient.
     from core import case_models  # noqa: E402
     from services import case_analysis_service  # noqa: E402
-except Exception:  # noqa: BLE001
+except Exception as exc:  # noqa: BLE001
     case_analysis_service = None
     case_models = None
+    _case_import_error = f"{type(exc).__name__}: {exc}"
+else:
+    _case_import_error = ""
 
 from ui import components, styles  # noqa: E402
 
@@ -1120,6 +1123,13 @@ def page_case() -> None:
             "ميزة تحليل الحالة غير متاحة في هذه النسخة المحمّلة على الخادم. "
             "أعد تشغيل التطبيق (Reboot app)."
         )
+        err = globals().get("_case_import_error") or st.session_state.get(
+            "case_import_error"
+        )
+        if err:
+            st.session_state["case_import_error"] = err
+            with st.expander("تشخيص (آمن — بدون محتوى مستندات)"):
+                st.code(str(err))
         return
 
     _mode_selector("case")

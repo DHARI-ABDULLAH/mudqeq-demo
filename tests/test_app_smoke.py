@@ -31,7 +31,13 @@ def test_sidebar_navigation_and_top_k_slider():
     at = _run()
     # Nav buttons for every page are present.
     labels = {b.label for b in at.sidebar.button}
-    for expected in ["المحادثة", "المستندات", "البحث", "حول النسخة التجريبية"]:
+    for expected in [
+        "المحادثة",
+        "تحليل حالة",
+        "المستندات",
+        "البحث",
+        "حول النسخة التجريبية",
+    ]:
         assert expected in labels
 
     # Retrieval control renders and is adjustable.
@@ -50,10 +56,54 @@ def test_empty_state_shows_upload_hint():
 
 def test_pages_render_without_exception():
     at = _run()
-    for label in ["المحادثة", "البحث", "حول النسخة التجريبية", "المستندات"]:
+    for label in [
+        "المحادثة",
+        "تحليل حالة",
+        "البحث",
+        "حول النسخة التجريبية",
+        "المستندات",
+    ]:
         button = next(b for b in at.sidebar.button if b.label == label)
         button.click().run()
         assert not at.exception, f"page '{label}' raised: {at.exception}"
+
+
+def _goto(at: AppTest, label: str) -> AppTest:
+    next(b for b in at.sidebar.button if b.label == label).click().run()
+    return at
+
+
+def test_case_page_shows_its_input_and_button():
+    at = _goto(_run(), "تحليل حالة")
+    assert not at.exception
+
+    # No documents yet, so the page stops at the upload hint.
+    assert "لا توجد مستندات" in " ".join(i.value for i in at.info)
+
+    headings = " ".join(str(m.value) for m in at.markdown)
+    assert "تحليل حالة" in headings
+
+
+def test_switching_between_chat_and_case_does_not_loop():
+    """The mode toggle must settle on the chosen page, not ping-pong."""
+    at = _goto(_run(), "تحليل حالة")
+    assert at.session_state["page"] == "case"
+
+    at = _goto(at, "المحادثة")
+    assert at.session_state["page"] == "chat"
+    assert at.session_state["interaction_mode"] == "chat"
+
+    at = _goto(at, "تحليل حالة")
+    assert at.session_state["page"] == "case"
+    assert at.session_state["interaction_mode"] == "case"
+    assert not at.exception
+
+
+def test_case_state_starts_empty():
+    at = _run()
+    assert at.session_state["case_outcome"] is None
+    assert at.session_state["case_state"] is None
+    assert at.session_state["case_followups"] == []
 
 
 def test_app_survives_stale_ui_components(monkeypatch):

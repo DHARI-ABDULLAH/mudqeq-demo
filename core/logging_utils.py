@@ -37,6 +37,12 @@ _ALLOWED_FIELDS = {
     "http_status",
     "error_category",
     "attempts",
+    # Case-analysis metadata (counters only — never case or document text).
+    "stage",
+    "num_queries",
+    "num_evidence",
+    "num_documents",
+    "llm_calls",
 }
 
 
