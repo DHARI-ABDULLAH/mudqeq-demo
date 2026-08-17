@@ -99,6 +99,18 @@ try:  # newer than the first deploy; never break start-up if absent
 except Exception:  # noqa: BLE001
     chat_service = None
 
+try:  # URL sources ship after the first deploy; keep start-up resilient.
+    from services import url_fetch_service  # noqa: E402
+    from services import url_security_service  # noqa: E402
+    from services import url_source_service  # noqa: E402
+except Exception as exc:  # noqa: BLE001
+    url_source_service = None
+    url_security_service = None
+    url_fetch_service = None
+    _url_import_error = f"{type(exc).__name__}: {exc}"
+else:
+    _url_import_error = ""
+
 try:  # "تحليل حالة" ships after the first deploy; keep start-up resilient.
     from core import case_models  # noqa: E402
     from services import case_analysis_service  # noqa: E402
@@ -124,10 +136,11 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
+# "المصادر" covers both source kinds: uploaded files and fetched web pages.
 NAV = [
     ("chat", "المحادثة"),
     ("case", "تحليل حالة"),
-    ("documents", "المستندات"),
+    ("documents", "المصادر"),
     ("search", "البحث"),
     ("about", "حول النسخة التجريبية"),
 ]
@@ -204,6 +217,23 @@ def _max_files_per_session() -> int:
     return max(1, _cfg_int("MAX_FILES_PER_SESSION", 5))
 
 
+def _max_url_sources_per_session() -> int:
+    return max(1, _cfg_int("MAX_URL_SOURCES_PER_SESSION", 5))
+
+
+def _url_limits_caption() -> str:
+    fn = getattr(config, "url_limits_caption_ar", None)
+    if fn is not None:
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            pass
+    return (
+        "صفحات ويب عامة فقط (http/https)، بحد أقصى "
+        f"{_max_url_sources_per_session()} روابط في الجلسة."
+    )
+
+
 # --- Defensive service accessors ------------------------------------------
 def _is_valid_id(value) -> bool:
     fn = getattr(security, "is_valid_id", None)
@@ -244,6 +274,52 @@ def _ready_documents(session_id: str) -> list:
         except Exception:  # noqa: BLE001
             pass
     return [d for d in _list_documents(session_id) if getattr(d, "status", "") == "ready"]
+
+
+def _list_sources(session_id: str) -> list:
+    """Every source in the session — files and links — newest first."""
+    fn = getattr(session_service, "list_sources", None)
+    if fn is not None:
+        try:
+            return list(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return _list_documents(session_id)
+
+
+def _ready_sources(session_id: str) -> list:
+    """Sources that finished indexing and can be selected for a question."""
+    fn = getattr(session_service, "ready_sources", None)
+    if fn is not None:
+        try:
+            return list(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return _ready_documents(session_id)
+
+
+def _live_url_count(session_id: str) -> int:
+    fn = getattr(session_service, "live_url_count", None)
+    if fn is not None:
+        try:
+            return int(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return sum(1 for s in _list_sources(session_id) if getattr(s, "is_url", False))
+
+
+def _has_url_slot(session_id: str) -> bool:
+    fn = getattr(session_service, "has_url_slot", None)
+    if fn is not None:
+        try:
+            return bool(fn(session_id))
+        except Exception:  # noqa: BLE001
+            pass
+    return _live_url_count(session_id) < _max_url_sources_per_session()
+
+
+def _url_sources_enabled() -> bool:
+    return url_source_service is not None
 
 
 def _live_document_count(session_id: str) -> int:
@@ -311,6 +387,15 @@ def _delete_document(session_id: str, document_id: str) -> None:
         fn(session_id)
         return
     raise RuntimeError("no delete API available")
+
+
+def _delete_source(session_id: str, source: object) -> None:
+    """Delete either source kind. Both store the same artefacts on disk."""
+    source_id = getattr(source, "document_id", source)
+    if getattr(source, "is_url", False) and url_source_service is not None:
+        url_source_service.delete_url_source(session_id, source_id)
+        return
+    _delete_document(session_id, source_id)
 
 
 def _note_failure(where: str, exc: BaseException) -> None:
@@ -448,6 +533,8 @@ def _capabilities() -> dict[str, bool]:
         ),
         "llm_service(OpenAI)": getattr(llm_service, "PROVIDER_NAME", "") == "OpenAI",
         "components.dashboard": hasattr(components, "dashboard"),
+        "services.url_source_service": url_source_service is not None,
+        "session_service.ready_sources": hasattr(session_service, "ready_sources"),
     }
 
 
@@ -650,25 +737,48 @@ def _sidebar() -> None:
                 pass
 
 
-# --- Document selector (shared by chat + search) --------------------------
+# --- Source selector (shared by chat + search + case) ---------------------
+def _source_option_label(source) -> str:
+    """Icon + name for one selectable source (file or link)."""
+    fn = _ui("source_label")
+    if fn is not None:
+        try:
+            return str(fn(source))
+        except Exception:  # noqa: BLE001
+            pass
+    name = getattr(source, "display_name", "") or "مصدر"
+    if getattr(source, "is_url", False):
+        domain = getattr(source, "domain", "")
+        return f"🔗 {name} — {domain}" if domain else f"🔗 {name}"
+    return f"📄 {name}"
+
+
 def _document_selector(ready_docs: list, key: str) -> list[str]:
-    """Multiselect with a 'جميع المستندات' sentinel. Returns resolved doc ids."""
-    id_to_name = {d.document_id: d.display_name for d in ready_docs}
-    options = [ALL_DOCS] + list(id_to_name.keys())
+    """Multiselect over every source, with a 'جميع المصادر' sentinel.
+
+    Files and links share one list and one id space, so any combination —
+    one file, several files, several links, or a mix — is just a selection.
+    Returns the resolved source ids in the order they were listed.
+    """
+    id_to_source = {d.document_id: d for d in ready_docs}
+    options = [ALL_DOCS] + list(id_to_source.keys())
 
     # Initialize once, then prune stale ids so the widget state stays valid.
     if key not in st.session_state:
         st.session_state[key] = [ALL_DOCS]
-    pruned = [s for s in st.session_state[key] if s == ALL_DOCS or s in id_to_name]
+    pruned = [s for s in st.session_state[key] if s == ALL_DOCS or s in id_to_source]
     st.session_state[key] = pruned or [ALL_DOCS]
 
     def _fmt(opt: str) -> str:
-        return "جميع المستندات" if opt == ALL_DOCS else id_to_name.get(opt, opt)
+        if opt == ALL_DOCS:
+            return "جميع المصادر"
+        source = id_to_source.get(opt)
+        return _source_option_label(source) if source is not None else opt
 
     selection = st.multiselect("البحث في:", options, format_func=_fmt, key=key)
     if ALL_DOCS in selection or not selection:
-        return list(id_to_name.keys())
-    return [s for s in selection if s in id_to_name]
+        return list(id_to_source.keys())
+    return [s for s in selection if s in id_to_source]
 
 
 _MODE_PAGES = [("chat", "سؤال عن المستند"), ("case", "تحليل حالة")]
@@ -706,57 +816,175 @@ def _mode_selector(current: str) -> None:
 
 # --- Pages ----------------------------------------------------------------
 def page_documents() -> None:
-    _page_header("المستندات", "أضف مستنداتك وأدرها مؤقتاً ضمن جلستك التجريبية.")
+    _page_header("المصادر", "أضف ملفاتك وروابطك وأدرها مؤقتاً ضمن جلستك التجريبية.")
 
+    sources = _list_sources(_sid())
+
+    with st.expander("＋ إضافة مصدر جديد", expanded=(len(sources) == 0)):
+        if _url_sources_enabled():
+            tab_file, tab_link = st.tabs(["📄 رفع ملف", "🔗 إضافة رابط"])
+            with tab_file:
+                _render_upload_form()
+            with tab_link:
+                _render_add_url_form()
+        else:
+            _render_upload_form()
+
+    if not sources:
+        st.info("لا توجد مستندات أو روابط بعد. أضف مصدراً للبدء.")
+        return
+
+    st.markdown("### مصادرك")
+    for source in sources:
+        _render_source_row(source)
+
+
+def _render_upload_form() -> None:
     live = _live_document_count(_sid())
     max_files = _max_files_per_session()
     can_add = live < max_files
 
-    with st.expander("＋ إضافة مستند جديد", expanded=(live == 0)):
-        if not can_add:
-            st.info(
-                f"تم الوصول إلى الحد الأقصى ({max_files} مستندات). "
-                "احذف مستنداً لإضافة آخر."
-            )
-        st.caption(_upload_limits_caption())
-        uploaded = st.file_uploader(
-            "اختر ملف PDF (يمكن اختيار أكثر من ملف)",
-            type=["pdf"],
-            accept_multiple_files=True,
-            disabled=not can_add,
-            key=f"uploader_{live}",
+    if not can_add:
+        st.info(
+            f"تم الوصول إلى الحد الأقصى ({max_files} مستندات). "
+            "احذف مستنداً لإضافة آخر."
         )
-        if uploaded and st.button("رفع وفهرسة", type="primary", disabled=not can_add):
-            _ingest_uploads(uploaded)
+    st.caption(_upload_limits_caption())
+    uploaded = st.file_uploader(
+        "اختر ملف PDF (يمكن اختيار أكثر من ملف)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        disabled=not can_add,
+        key=f"uploader_{live}",
+    )
+    if uploaded and st.button("رفع وفهرسة", type="primary", disabled=not can_add):
+        _ingest_uploads(uploaded)
 
-    docs = _list_documents(_sid())
-    if not docs:
-        st.info("لا توجد مستندات بعد. أضف مستنداً للبدء.")
+
+def _render_add_url_form() -> None:
+    """The add-link form: one input, one button, live stage progress."""
+    can_add = _has_url_slot(_sid())
+    if not can_add:
+        st.info(
+            f"تم الوصول إلى الحد الأقصى ({_max_url_sources_per_session()} روابط). "
+            "احذف رابطاً لإضافة آخر."
+        )
+    st.caption(_url_limits_caption())
+    raw_url = st.text_input(
+        "رابط الصفحة",
+        placeholder="https://example.com/page",
+        key="add_url_input",
+        disabled=not can_add,
+    )
+    if st.button("إضافة الرابط", type="primary", disabled=not can_add, key="add_url_btn"):
+        _ingest_url(raw_url)
+
+
+def _url_progress(placeholder):
+    """Render the fetch/extract/chunk/index stages as they happen."""
+    stages = list(getattr(url_source_service, "STAGE_ORDER", ()))
+    labels = dict(getattr(url_source_service, "STAGE_LABELS_AR", {}))
+
+    def render(stage: str, label: str) -> None:
+        if not stages:
+            placeholder.info(f"⏳ {label}")
+            return
+        current = stages.index(stage) if stage in stages else 0
+        lines = []
+        for index, key in enumerate(stages):
+            mark = "✅" if index < current else ("⏳" if index == current else "◻️")
+            lines.append(f"{mark} {labels.get(key, key)}")
+        placeholder.markdown("  \n".join(lines))
+
+    return render
+
+
+def _ingest_url(raw_url: str) -> None:
+    """Add one URL source, reporting every failure in plain Arabic.
+
+    A fetch/extract failure is reported as exactly that. It is never shown as
+    "no information found", which would send the user looking for content in a
+    page the server never managed to read.
+    """
+    if not (raw_url or "").strip():
+        st.warning("يرجى إدخال رابط الصفحة.")
+        return
+    if url_source_service is None:
+        st.error("ميزة إضافة الروابط غير متاحة في هذه النسخة المحمّلة على الخادم.")
         return
 
-    st.markdown("### مستنداتك")
-    for doc in docs:
-        _render_document_card(doc)
-        if st.session_state.get("confirm_delete") == doc.document_id:
-            st.warning(f"هل أنت متأكد من حذف: {doc.display_name}؟ لا يمكن التراجع.")
-            c1, c2 = st.columns(2)
-            if c1.button("نعم، احذف", key=f"yes_{doc.document_id}", type="primary"):
-                _delete_document(_sid(), doc.document_id)
-                st.session_state["confirm_delete"] = None
-                st.success("تم حذف المستند.")
-                st.rerun()
-            if c2.button("إلغاء", key=f"no_{doc.document_id}"):
-                st.session_state["confirm_delete"] = None
-                st.rerun()
-        else:
-            c1, c2 = st.columns(2)
-            if c1.button("فتح في المحادثة", key=f"open_{doc.document_id}"):
-                st.session_state["chat_doc_selector"] = [doc.document_id]
-                st.session_state["page"] = "chat"
-                st.rerun()
-            if c2.button("حذف", key=f"del_{doc.document_id}"):
-                st.session_state["confirm_delete"] = doc.document_id
-                st.rerun()
+    placeholder = st.empty()
+    try:
+        result = url_source_service.add_url(
+            _sid(), raw_url, progress=_url_progress(placeholder)
+        )
+    except Exception as exc:  # noqa: BLE001 - categorised below, never leaked
+        placeholder.empty()
+        reason, message = url_source_service.describe_error(exc)
+        st.session_state["last_error"] = f"add_url: {reason}"
+        st.error(message)
+        return
+
+    placeholder.empty()
+    st.success(
+        f"تم تجهيز الرابط: {result.display_name} "
+        f"({result.num_chunks} مقطع من {result.domain})."
+    )
+    if result.truncated:
+        st.info("الصفحة طويلة، وتمت فهرسة الجزء الأول منها ضمن حدود النسخة التجريبية.")
+    st.session_state["messages"] = []
+    st.rerun()
+
+
+def _refresh_url(source_id: str) -> None:
+    if url_source_service is None:
+        return
+    placeholder = st.empty()
+    try:
+        result = url_source_service.refresh_url(
+            _sid(), source_id, progress=_url_progress(placeholder)
+        )
+    except Exception as exc:  # noqa: BLE001
+        placeholder.empty()
+        reason, message = url_source_service.describe_error(exc)
+        st.session_state["last_error"] = f"refresh_url: {reason}"
+        st.error(message)
+        return
+
+    placeholder.empty()
+    st.success(f"تم تحديث محتوى الرابط ({result.num_chunks} مقطع).")
+    st.rerun()
+
+
+def _render_source_row(source) -> None:
+    """One card plus its actions (open / refresh for links / delete)."""
+    source_id = source.document_id
+    _render_document_card(source)
+
+    if st.session_state.get("confirm_delete") == source_id:
+        st.warning(f"هل أنت متأكد من حذف: {source.display_name}؟ لا يمكن التراجع.")
+        c1, c2 = st.columns(2)
+        if c1.button("نعم، احذف", key=f"yes_{source_id}", type="primary"):
+            _delete_source(_sid(), source)
+            st.session_state["confirm_delete"] = None
+            st.success("تم حذف المصدر.")
+            st.rerun()
+        if c2.button("إلغاء", key=f"no_{source_id}"):
+            st.session_state["confirm_delete"] = None
+            st.rerun()
+        return
+
+    is_url = bool(getattr(source, "is_url", False))
+    columns = st.columns(3 if is_url else 2)
+    if columns[0].button("فتح في المحادثة", key=f"open_{source_id}"):
+        st.session_state["chat_doc_selector"] = [source_id]
+        st.session_state["page"] = "chat"
+        st.rerun()
+    if is_url and columns[1].button("تحديث المحتوى", key=f"refresh_{source_id}"):
+        _refresh_url(source_id)
+    if columns[-1].button("حذف", key=f"del_{source_id}"):
+        st.session_state["confirm_delete"] = source_id
+        st.rerun()
 
 
 def _ingest_uploads(uploaded) -> None:
@@ -788,12 +1016,12 @@ def _ingest_uploads(uploaded) -> None:
 
 
 def _no_documents_notice() -> None:
-    st.info("لا توجد مستندات جاهزة. أضف مستنداً من قسم «المستندات» أولاً.")
+    st.info("لا توجد مستندات أو روابط جاهزة. أضف مصدراً من قسم «المصادر» أولاً.")
 
 
 def page_search() -> None:
-    _page_header("البحث", "بحث دلالي مباشر داخل مستنداتك — بدون نموذج ذكاء اصطناعي خارجي.")
-    ready = _ready_documents(_sid())
+    _page_header("البحث", "بحث دلالي مباشر داخل مصادرك — بدون نموذج ذكاء اصطناعي خارجي.")
+    ready = _ready_sources(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -814,7 +1042,7 @@ def page_search() -> None:
     if not query:
         return
     if not resolved:
-        st.warning("يرجى اختيار مستند واحد على الأقل.")
+        st.warning("يرجى اختيار مصدر واحد على الأقل.")
         return
 
     try:
@@ -834,8 +1062,8 @@ def page_search() -> None:
 
 
 def page_chat() -> None:
-    _page_header("المحادثة", "اسأل عن محتوى مستنداتك واحصل على إجابة بمصادرها.")
-    ready = _ready_documents(_sid())
+    _page_header("المحادثة", "اسأل عن محتوى مصادرك واحصل على إجابة بمصادرها.")
+    ready = _ready_sources(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -884,7 +1112,7 @@ def page_chat() -> None:
         return
 
     if not resolved:
-        st.warning("يرجى اختيار مستند واحد على الأقل قبل إرسال السؤال.")
+        st.warning("يرجى اختيار مصدر واحد على الأقل قبل إرسال السؤال.")
         return
 
     question = question.strip()[: _cfg_int("MAX_QUESTION_CHARS", 2000)]
@@ -893,10 +1121,10 @@ def page_chat() -> None:
         st.markdown(question)
 
     mode = _classify(question)
-    # Overview questions ("لخص المستند", "what is inside the pdf") read the
-    # document in page order; specific questions use Top-K retrieval.
+    # Overview questions ("لخص المستند", "what is inside the pdf") read each
+    # source in order; specific questions use Top-K retrieval.
     spinner_text = (
-        "جاري قراءة المستندات..." if mode == "overview" else "جاري البحث في المستندات..."
+        "جاري قراءة المصادر..." if mode == "overview" else "جاري البحث في المصادر..."
     )
 
     with st.chat_message("assistant"):
@@ -1116,7 +1344,7 @@ def _run_case_analysis(case_text: str, resolved: list, *, force: bool) -> None:
 def page_case() -> None:
     _page_header(
         "تحليل حالة",
-        "اكتب مشكلة واقعية كاملة، ويقوم النظام بتحليلها والبحث عنها في مستنداتك.",
+        "اكتب مشكلة واقعية كاملة، ويقوم النظام بتحليلها والبحث عنها في مصادرك.",
     )
     if case_analysis_service is None:
         st.warning(
@@ -1134,7 +1362,7 @@ def page_case() -> None:
 
     _mode_selector("case")
 
-    ready = _ready_documents(_sid())
+    ready = _ready_sources(_sid())
     if not ready:
         _no_documents_notice()
         return
@@ -1173,7 +1401,7 @@ def page_case() -> None:
 
     if run:
         if not resolved:
-            st.warning("يرجى اختيار مستند واحد على الأقل قبل تحليل الحالة.")
+            st.warning("يرجى اختيار مصدر واحد على الأقل قبل تحليل الحالة.")
         elif not (case_text or "").strip():
             st.warning(case_analysis_service.NO_CASE_TEXT_MESSAGE)
         else:
@@ -1263,30 +1491,49 @@ def page_about() -> None:
 - **النسخة التجريبية (هذه):** مستضافة على الإنترنت لأغراض العرض. تُعالَج
   المستندات مؤقتاً على خادم العرض وتُحذف تلقائياً بعد انتهاء مدة الجلسة.
 
+### أنواع المصادر
+
+- **📄 ملف PDF:** يُرفع من جهازك، ويُستشهد به برقم الصفحة.
+- **🔗 رابط صفحة ويب:** يجلبه الخادم مرة واحدة، ويستخرج نصها المقروء فقط،
+  ويُستشهد به بعنوان الصفحة والنطاق مع رابط الصفحة الأصلية.
+
+يمكن اختيار أي مجموعة من الملفات والروابط معاً في المحادثة والبحث وتحليل الحالة.
+
 ### ما الذي يُرسَل إلى مزوّد النموذج المستضاف؟
 
 عند استخدام **المحادثة** فقط، يُرسَل إلى المزوّد المُهيّأ:
 - نص سؤالك.
-- الحد الأدنى من المقاطع المسترجعة ذات الصلة (Top-K) مع أرقام صفحاتها.
+- الحد الأدنى من المقاطع المسترجعة ذات الصلة (Top-K) مع أرقام صفحاتها أو
+  عناوين أقسامها.
 
-**لا يُرسَل** الملف الكامل، ولا بقية المستند. **البحث** يعمل محلياً بالكامل على
-الخادم دون أي خدمة خارجية.
+**لا يُرسَل** الملف الكامل، ولا صفحة الويب كاملة. **البحث** يعمل محلياً بالكامل
+على الخادم دون أي خدمة خارجية.
 
 ### الحدود الحالية للنسخة التجريبية
 
 - الحجم الأقصى للملف: {_cfg_int('MAX_FILE_SIZE_MB', 50)} ميغابايت.
 - الحد الأقصى للصفحات: {_cfg_int('MAX_PAGES', 200)} صفحة لكل ملف.
 - عدد المستندات في الجلسة: {_max_files_per_session()}.
+- عدد الروابط في الجلسة: {_max_url_sources_per_session()}.
+- الحجم الأقصى لصفحة الويب: {_cfg_int('MAX_URL_RESPONSE_BYTES', 5_000_000) // (1024 * 1024)} ميغابايت.
 - الحد الأقصى للأسئلة في الجلسة: {_cfg_int('MAX_QUESTIONS_PER_SESSION', 20)}.
 - الحد الأقصى لتحليلات الحالة في الجلسة: {_cfg_int('MAX_CASES_PER_SESSION', 3)}.
 - مدة الجلسة قبل الحذف التلقائي: {_cfg_int('SESSION_TTL_MINUTES', 30)} دقيقة.
 
+### أمان الروابط
+
+يرفض الخادم أي رابط لا يبدأ بـ http أو https، وأي رابط يشير إلى الخادم نفسه أو
+إلى شبكة داخلية أو إلى عناوين الخدمات السحابية الداخلية، ويعيد التحقق من كل
+إعادة توجيه قبل الاتصال بها. محتوى صفحات الويب يُعامَل كبيانات غير موثوقة تماماً
+مثل نص ملفات PDF، ولا تُنفَّذ أي تعليمات مكتوبة داخله.
+
 ### مزوّد النموذج
 
-تتم صياغة الإجابات عبر واجهة **OpenAI** البرمجية. لا يُرفع ملف PDF كاملاً إلى
-المزوّد؛ يُرسَل فقط سؤالك مع مقاطع نصية محدودة الحجم مستخرجة من المستندات التي
-اخترتها. الاستخراج والتقطيع والتمثيل المتجهي والبحث (FAISS) تتم كلها محلياً على
-خادم النسخة التجريبية. لا تُستخدم النسخة التجريبية للمستندات الحساسة.
+تتم صياغة الإجابات عبر واجهة **OpenAI** البرمجية. لا يُرفع ملف PDF كاملاً ولا
+صفحة ويب كاملة إلى المزوّد؛ يُرسَل فقط سؤالك مع مقاطع نصية محدودة الحجم مستخرجة
+من المصادر التي اخترتها. الجلب والاستخراج والتقطيع والتمثيل المتجهي والبحث
+(FAISS) تتم كلها محلياً على خادم النسخة التجريبية. لا تُستخدم النسخة التجريبية
+للمستندات الحساسة.
         """
     )
     st.caption(f"الإصدار: {getattr(config, 'DEMO_VERSION', '')}")

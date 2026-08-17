@@ -60,6 +60,19 @@ def _int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def _float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    """Read a float env var and clamp it to [minimum, maximum]."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = default
+    return max(minimum, min(maximum, value))
+
+
 # --- Temporary, ephemeral storage (NEVER the desktop storage tree) --------
 # Root for all per-session working directories. Defaults to the system temp
 # area so nothing is ever persisted alongside the repository.
@@ -150,6 +163,50 @@ def upload_limits_caption_ar() -> str:
         f"PDF فقط، بحد أقصى {MAX_FILE_SIZE_MB} ميغابايت و"
         f"{MAX_PAGES} صفحة لكل ملف."
     )
+
+
+# --- URL sources ("إضافة رابط") -------------------------------------------
+# A URL source is fetched BY THE SERVER, so every bound here is a safety limit
+# rather than a comfort setting: an unbounded fetch is a denial-of-service and
+# an unbounded destination is a server-side request forgery.
+MAX_URL_SOURCES_PER_SESSION = _int_env(
+    "MAX_URL_SOURCES_PER_SESSION", 5, minimum=1, maximum=20
+)
+# Total fetch operations (adds + refreshes) allowed in one session.
+MAX_URLS_PER_SESSION = _int_env("MAX_URLS_PER_SESSION", 15, minimum=1, maximum=200)
+# Hard ceiling on bytes read from a remote host. Enforced while streaming, not
+# from the Content-Length header, which a hostile server is free to lie about.
+MAX_URL_RESPONSE_BYTES = _int_env(
+    "MAX_URL_RESPONSE_BYTES", 5_000_000, minimum=10_000, maximum=50_000_000
+)
+# Ceiling on readable text kept after extraction (bounds embedding + memory).
+MAX_URL_EXTRACTED_CHARS = _int_env(
+    "MAX_URL_EXTRACTED_CHARS", 400_000, minimum=1_000, maximum=5_000_000
+)
+# Below this, the page is treated as "no readable content" rather than indexed.
+MIN_URL_EXTRACTED_CHARS = _int_env(
+    "MIN_URL_EXTRACTED_CHARS", 200, minimum=20, maximum=10_000
+)
+URL_CONNECT_TIMEOUT = _float_env("URL_CONNECT_TIMEOUT", 5.0, minimum=1.0, maximum=30.0)
+URL_READ_TIMEOUT = _float_env("URL_READ_TIMEOUT", 15.0, minimum=1.0, maximum=120.0)
+MAX_URL_REDIRECTS = _int_env("MAX_URL_REDIRECTS", 3, minimum=0, maximum=10)
+MAX_URL_CHUNKS = _int_env("MAX_URL_CHUNKS", 600, minimum=10, maximum=5_000)
+# Only the standard web ports. A URL pointing at some other port is far more
+# likely to be probing an internal service than to be an article.
+URL_ALLOWED_PORTS = frozenset({80, 443})
+URL_USER_AGENT = os.environ.get(
+    "URL_USER_AGENT", f"MudqeqAI-Demo/{DEMO_VERSION} (+web demo source fetcher)"
+).strip() or f"MudqeqAI-Demo/{DEMO_VERSION}"
+
+
+def url_limits_caption_ar() -> str:
+    """Arabic hint for the add-link form — always matches server validation."""
+    return (
+        f"صفحات ويب عامة فقط (http/https)، بحد أقصى "
+        f"{MAX_URL_RESPONSE_BYTES // (1024 * 1024)} ميغابايت لكل صفحة و"
+        f"{MAX_URL_SOURCES_PER_SESSION} روابط في الجلسة."
+    )
+
 
 # --- Embeddings -----------------------------------------------------------
 # Same model as the desktop product. Runs locally on the demo server.
