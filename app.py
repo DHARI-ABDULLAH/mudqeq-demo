@@ -1075,7 +1075,7 @@ def _render_case_outcome(outcome) -> None:
             st.markdown(f"{index}. {missing.question}{reason}")
         return
 
-    if kind in (service.KIND_INDEX_ERROR, service.KIND_PROVIDER_ERROR):
+    if kind in (service.KIND_INDEX_ERROR, service.KIND_PROVIDER_ERROR, service.KIND_VERIFY_FAILED):
         st.error(outcome.text)
         return
 

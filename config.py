@@ -134,8 +134,8 @@ MAX_TOTAL_EVIDENCE_CHUNKS = _int_env(
 MAX_CASE_CONTEXT_CHARS = _int_env(
     "MAX_CASE_CONTEXT_CHARS", 14_000, minimum=1_000, maximum=60_000
 )
-# Worst case per successful analysis: understand + plan + solutions + report.
-MAX_CASE_LLM_CALLS = _int_env("MAX_CASE_LLM_CALLS", 4, minimum=1, maximum=8)
+# Worst case per successful analysis: understand + plan + solutions + report + verify.
+MAX_CASE_LLM_CALLS = _int_env("MAX_CASE_LLM_CALLS", 5, minimum=1, maximum=8)
 # Case analysis costs far more than one chat question, so it has its own quota
 # instead of silently draining MAX_QUESTIONS_PER_SESSION.
 MAX_CASES_PER_SESSION = _int_env("MAX_CASES_PER_SESSION", 3, minimum=1, maximum=50)
