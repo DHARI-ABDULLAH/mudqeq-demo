@@ -10,3 +10,12 @@ faiss-cpu==1.15.0
 numpy==2.4.6
 openai==3.1.0
 python-dotenv==1.1.0
+
+# URL sources: fetching a page and reducing it to readable text.
+# `requests` already ships as a Streamlit dependency; it is pinned here because
+# the URL fetcher relies on streaming + manual redirect control for SSRF
+# defence, so it must be an explicit, versioned dependency rather than a
+# transitive accident. `beautifulsoup4` is pure Python and is used with the
+# stdlib html.parser backend (no lxml, no C extension, no browser engine).
+requests==2.32.3
+beautifulsoup4==4.13.5

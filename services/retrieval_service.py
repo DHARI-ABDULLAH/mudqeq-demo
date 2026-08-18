@@ -43,6 +43,7 @@ import faiss
 import numpy as np
 
 from config import MAX_RAG_CONTEXT_CHARS, TOP_K
+from core.source_models import SOURCE_TYPE_PDF, normalize_source_type
 from services import embedding_service, security, session_service
 from services.security import require_valid_id
 
@@ -251,6 +252,30 @@ def _owned_ids(session_id: str, document_ids: Union[str, list[str]]) -> list[str
 
 
 # --- Search ---------------------------------------------------------------
+def _result_from_chunk(chunk: dict, score: float) -> dict:
+    """Shape one stored chunk as a retrieval result.
+
+    The PDF keys are unchanged. The provenance keys a web chunk needs are added
+    alongside them and default to the PDF values, so a caller that only knows
+    about documents keeps working and a caller that renders citations can tell
+    a page number from a page title. Internal ids stay out of results.
+    """
+    source_type = normalize_source_type(chunk.get("source_type"))
+    result = {
+        "score": float(score),
+        "document_name": chunk.get("document_name", ""),
+        "page_start": chunk.get("page_start"),
+        "page_end": chunk.get("page_end"),
+        "text": chunk.get("text", ""),
+        "source_type": source_type,
+    }
+    if source_type != SOURCE_TYPE_PDF:
+        result["url"] = chunk.get("url", "") or ""
+        result["page_title"] = chunk.get("page_title", "") or ""
+        result["section_title"] = chunk.get("section_title", "") or ""
+    return result
+
+
 def _search_one(session_id: str, document_id: str, q_emb, top_k: int) -> list[dict]:
     """Search a single owned document. Assumes ownership already verified."""
     index, chunks = _load(session_id, document_id)
@@ -264,16 +289,7 @@ def _search_one(session_id: str, document_id: str, q_emb, top_k: int) -> list[di
     for score, i in zip(scores[0], idx[0]):
         if i == -1 or i >= len(chunks):
             continue
-        c = chunks[i]
-        out.append(
-            {
-                "score": float(score),
-                "document_name": c.get("document_name", ""),
-                "page_start": c.get("page_start"),
-                "page_end": c.get("page_end"),
-                "text": c.get("text", ""),
-            }
-        )
+        out.append(_result_from_chunk(chunks[i], score))
     return out
 
 
@@ -369,15 +385,7 @@ def document_context(
             [c for _, c in ordered], max_chars=per_doc_budget
         )
         for c in selected:
-            out.append(
-                {
-                    "score": 1.0,
-                    "document_name": c.get("document_name", ""),
-                    "page_start": c.get("page_start"),
-                    "page_end": c.get("page_end"),
-                    "text": c.get("text", ""),
-                }
-            )
+            out.append(_result_from_chunk(c, 1.0))
     return out
 
 

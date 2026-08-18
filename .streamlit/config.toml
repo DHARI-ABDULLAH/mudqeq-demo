@@ -15,7 +15,7 @@ headless = true
 fileWatcherType = "none"
 # Keep the upload guard tight; application-level checks enforce the real
 # per-file limit, this is a coarse outer bound (MB).
-maxUploadSize = 15
+maxUploadSize = 50
 # XSRF protection stays ON. HF serves each Space on its own subdomain, so the
 # default same-origin XSRF/CORS behavior works without relaxation.
 enableXsrfProtection = true
@@ -28,7 +28,10 @@ gatherUsageStats = false
 [client]
 # Never surface Python tracebacks / internal details to public users.
 showErrorDetails = false
-toolbarMode = "minimal"
+# Hide Streamlit developer toolbar (Deploy / Rerun / Settings). Community Cloud
+# host actions (GitHub / Edit / Star / Share) are removed via ui/styles.py CSS
+# targeting [data-testid="stToolbarActions"].
+toolbarMode = "viewer"
 
 [theme]
 base = "light"

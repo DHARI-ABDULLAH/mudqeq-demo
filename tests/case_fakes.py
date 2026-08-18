@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 
 from services import case_analysis_service as cas
+from services import case_verifier_service as cvs
 from services import llm_service
 from services import query_planner_service as qps
 
@@ -24,6 +25,7 @@ UNDERSTAND = "understand"
 PLAN = "plan"
 SOLUTIONS = "solutions"
 REPORT = "report"
+VERIFY = "verify"
 FOLLOWUP = "followup"
 
 _STAGE_BY_INSTRUCTIONS = {
@@ -31,6 +33,7 @@ _STAGE_BY_INSTRUCTIONS = {
     qps.PLANNER_INSTRUCTIONS: PLAN,
     cas.SOLUTIONS_INSTRUCTIONS: SOLUTIONS,
     cas.REPORT_INSTRUCTIONS: REPORT,
+    cvs.VERIFY_INSTRUCTIONS: VERIFY,
     cas.FOLLOWUP_INSTRUCTIONS: FOLLOWUP,
 }
 
@@ -226,12 +229,48 @@ REPORT_MARKDOWN = """# تحليل الحالة
 متوسطة."""
 
 
+def verify_pass(**overrides) -> dict:
+    payload = {
+        "claims": [
+            {
+                "claim": "ينص المستند على التزام البائع بمدة التسليم",
+                "type": "document_fact",
+                "evidence_ids": ["E1"],
+                "support_level": "strong",
+                "conflicting_evidence_ids": [],
+                "is_recommendation": False,
+            },
+            {
+                "claim": "التعويض هو الأنسب حالياً",
+                "type": "inference",
+                "evidence_ids": ["E2"],
+                "support_level": "moderate",
+                "conflicting_evidence_ids": ["E2"],
+                "is_recommendation": True,
+            },
+        ],
+        "recommendation_determinable": True,
+        "recommendation_title": "طلب التعويض",
+        "recommendation_reason": "الفسخ مقيّد بالإعذار الكتابي",
+        "recommendation_evidence_ids": ["E2"],
+        "missing_information": [],
+        "conflicts": ["نص يجيز الفسخ ونص يشترط الإعذار"],
+        "evidence_coverage": "moderate",
+        "insufficient_documents": False,
+        "insufficient_case_facts": False,
+        "tie_between_solutions": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def full_script(**overrides) -> dict:
     script = {
         UNDERSTAND: understanding(),
         PLAN: plan(),
         SOLUTIONS: solutions(),
         REPORT: REPORT_MARKDOWN,
+        VERIFY: verify_pass(),
         FOLLOWUP: "اعتمدت على النص الوارد في (E2).",
     }
     script.update(overrides)

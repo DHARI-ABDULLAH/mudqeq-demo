@@ -54,6 +54,7 @@ from core.case_models import (
 )
 from core.logging_utils import log_event
 from services import (
+    case_verifier_service,
     evidence_service,
     llm_service,
     query_planner_service,
@@ -70,6 +71,7 @@ KIND_QUOTA = "quota_exceeded"
 KIND_INDEX_ERROR = "index_error"
 KIND_NO_EVIDENCE = "no_evidence"
 KIND_PROVIDER_ERROR = "provider_error"
+KIND_VERIFY_FAILED = "verify_failed"
 
 # --- Pipeline stages (used for progress + failure reporting) --------------
 STAGE_UNDERSTAND = "understand"
@@ -78,6 +80,7 @@ STAGE_RETRIEVE = "retrieve"
 STAGE_EVIDENCE = "evidence"
 STAGE_SOLUTIONS = "solutions"
 STAGE_REPORT = "report"
+STAGE_VERIFY = "verify"
 
 STAGE_LABELS_AR = {
     STAGE_UNDERSTAND: "فهم الحالة",
@@ -86,6 +89,7 @@ STAGE_LABELS_AR = {
     STAGE_EVIDENCE: "جمع الأدلة",
     STAGE_SOLUTIONS: "مقارنة الحلول",
     STAGE_REPORT: "إعداد النتيجة",
+    STAGE_VERIFY: "التحقق من الاستناد",
 }
 
 STAGE_ORDER = (
@@ -95,6 +99,7 @@ STAGE_ORDER = (
     STAGE_EVIDENCE,
     STAGE_SOLUTIONS,
     STAGE_REPORT,
+    STAGE_VERIFY,
 )
 
 # --- Arabic user-facing messages ------------------------------------------
@@ -111,6 +116,10 @@ NO_EVIDENCE_MESSAGE = (
     "جرّب اختيار مستندات أخرى أو إعادة صياغة تفاصيل الحالة."
 )
 NEEDS_INFO_MESSAGE = "أحتاج معلومات إضافية قبل إكمال التحليل"
+VERIFY_FAILURE_MESSAGE = (
+    "تم إعداد التحليل، لكن تعذر التحقق النهائي من مدى استناده إلى المستندات. "
+    "لم يتم عرض توصية نهائية غير متحققة."
+)
 
 _INSUFFICIENT_AR = "لا تكفي المستندات الحالية للوصول إلى نتيجة موثوقة."
 
@@ -206,7 +215,10 @@ REPORT_INSTRUCTIONS = f"""أنت "المدقق الشامل"، محلل حالا
 # الاستشهاد
 - استشهد بعد كل نقطة جوهرية بمعرّف الدليل بين قوسين هكذا: (E2) أو (E1، E3).
 - لا تستخدم معرّفاً غير موجود في قائمة الأدلة المعروضة عليك.
-- لا تخترع أسماء مستندات أو أرقام صفحات؛ أرقام الصفحات تُضاف تلقائياً لاحقاً.
+- الأدلة تأتي من ملفات (لها أرقام صفحات) ومن صفحات ويب (لها عناوين وأقسام).
+- لا تخترع أسماء مستندات أو أرقام صفحات أو عناوين صفحات، ولا تكتب أي رابط
+  (URL) في التقرير؛ أسماء المصادر وأرقام صفحاتها وروابطها تُضاف تلقائياً
+  لاحقاً من بيانات المصادر الفعلية.
 
 # مستوى قوة الاستناد
 قدّره بكلمة واحدة: "قوية" أو "متوسطة" أو "محدودة"، بناءً على كمية الأدلة
@@ -271,6 +283,7 @@ class CaseOutcome:
     citations: list = field(default_factory=list)
     missing_information: list = field(default_factory=list)
     grounding: str = ""
+    verification: object = None
     diagnostics: dict = field(default_factory=dict)
     llm_calls: int = 0
     error_reason: str = ""
@@ -427,17 +440,23 @@ def collect_citations(evidence: list, report_markdown: str) -> list:
 
 
 def render_sources_section(citations: list) -> str:
-    """The report's "## 10. المصادر" block, built from real chunks only."""
+    """The report's "## 10. المصادر" block, built from real chunks only.
+
+    Each line is rendered from the evidence's own stored metadata: a document
+    gets its filename and page range, a web page gets its title, domain, and a
+    link to the address the server actually fetched. Nothing here comes from
+    the model's text, so a citation cannot name a source that does not exist.
+    """
     if not citations:
         return ""
     lines = ["", "## 10. المصادر", ""]
     seen: set = set()
-    for item in citations:
-        line = f"- {item.citation_ar()}"
-        if line in seen:
+    for index, item in enumerate(citations, start=1):
+        rendered = item.citation_markdown_ar()
+        if rendered in seen:
             continue
-        seen.add(line)
-        lines.append(line)
+        seen.add(rendered)
+        lines.append(f"{index}. {rendered}")
     return "\n".join(lines)
 
 
@@ -668,19 +687,60 @@ def analyze(
         )
 
     report_markdown = report_result.text.strip()
-    citations = collect_citations(evidence, report_markdown)
-    report_markdown = f"{report_markdown}\n{render_sources_section(citations)}".rstrip()
 
-    # Only a complete, cited report costs the user a case operation.
+    # --- 8. Groundedness verification (one extra LLM call, bounded) ---------
+    _notify(progress, STAGE_VERIFY)
+    verification = case_verifier_service.verify(
+        session_id,
+        report_markdown,
+        case,
+        evidence,
+        solution_set,
+        case_text=full_case_text,
+    )
+    llm_calls += 1
+    if not verification.ok:
+        log_event(
+            "case_analysis",
+            session_id,
+            status="verify_failed",
+            stage=STAGE_VERIFY,
+            error_category=verification.error_category,
+            llm_calls=llm_calls,
+        )
+        return CaseOutcome(
+            kind=KIND_VERIFY_FAILED,
+            stage=STAGE_VERIFY,
+            text=VERIFY_FAILURE_MESSAGE,
+            structured_case=case,
+            solution_set=solution_set,
+            queries=queries,
+            evidence=evidence,
+            diagnostics={
+                **diagnostics,
+                "failed_stage": STAGE_VERIFY,
+                "error": verification.error_category,
+                "llm_calls": llm_calls,
+            },
+            llm_calls=llm_calls,
+            error_reason=verification.error_category,
+        )
+
+    report_markdown, citations, grounding = case_verifier_service.apply(
+        report_markdown, verification, evidence, solution_set
+    )
+
+    # Only a verified, complete report costs the user a case operation.
     session_service.record_case(session_id)
 
     diagnostics["llm_calls"] = llm_calls
     diagnostics["grounding"] = grounding
+    diagnostics["evidence_coverage"] = verification.evidence_coverage
     log_event(
         "case_analysis",
         session_id,
         status="ok",
-        stage=STAGE_REPORT,
+        stage=STAGE_VERIFY,
         num_queries=len(queries),
         num_evidence=len(evidence),
         num_documents=len(owned),
@@ -700,7 +760,7 @@ def analyze(
 
     return CaseOutcome(
         kind=KIND_REPORT,
-        stage=STAGE_REPORT,
+        stage=STAGE_VERIFY,
         text=report_markdown,
         report_markdown=report_markdown,
         structured_case=case,
@@ -708,8 +768,11 @@ def analyze(
         queries=queries,
         evidence=evidence,
         citations=citations,
-        missing_information=list(case.missing_information),
+        missing_information=list(
+            verification.missing_information or case.missing_information
+        ),
         grounding=grounding,
+        verification=verification,
         diagnostics=diagnostics,
         llm_calls=llm_calls,
         state=state,

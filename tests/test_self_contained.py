@@ -157,3 +157,23 @@ def test_logging_whitelist_cannot_carry_a_key_or_content():
 
     forbidden = {"api_key", "key", "token", "text", "content", "question", "answer"}
     assert not forbidden & logging_utils._ALLOWED_FIELDS
+
+
+def test_host_toolbar_actions_hidden_via_css():
+    """Community Cloud GitHub/Edit/Star/Share render in stToolbarActions."""
+    from ui import styles
+
+    css = styles._CSS
+    for selector in (
+        '[data-testid="stToolbarActions"]',
+        '[data-testid="stToolbarActionButton"]',
+        '[data-testid="stToolbar"]',
+    ):
+        assert selector in css
+    assert "display: none !important" in css
+
+
+def test_streamlit_toolbar_mode_viewer():
+    cfg = WEB_DEMO_ROOT / ".streamlit" / "config.toml"
+    text = cfg.read_text(encoding="utf-8")
+    assert 'toolbarMode = "viewer"' in text

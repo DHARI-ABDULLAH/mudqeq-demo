@@ -35,6 +35,7 @@ from core.case_models import (
     Evidence,
     make_chunk_id,
 )
+from core.source_models import SOURCE_TYPE_PDF, SOURCE_TYPE_URL
 from services import retrieval_service, security, session_service
 
 # Score fractions (relative to the best hit in this run) that separate the
@@ -53,7 +54,11 @@ class EvidenceUnavailable(Exception):
 
 
 def owned_document_ids(session_id: str, document_ids) -> list[str]:
-    """Filter a selection down to documents this session actually owns."""
+    """Filter a selection down to sources this session actually owns.
+
+    Works for both PDF and URL sources — ownership is checked against the
+    session's source table, which holds both kinds under the same ids.
+    """
     out: list[str] = []
     for doc_id in document_ids or []:
         if not security.is_valid_id(doc_id):
@@ -128,6 +133,13 @@ def collect(
                         score=score,
                         text=text,
                         queries=[query_text],
+                        # Provenance is copied straight from the stored chunk,
+                        # so a web citation can only ever name a page the
+                        # server itself fetched.
+                        source_type=hit.get("source_type") or SOURCE_TYPE_PDF,
+                        url=hit.get("url") or "",
+                        page_title=hit.get("page_title") or "",
+                        section_title=hit.get("section_title") or "",
                     )
                 else:
                     # Same chunk, another query: keep the best score and record
@@ -179,19 +191,39 @@ def classify_strength(item: Evidence, *, best_score: float) -> str:
     return STRENGTH_POSSIBLE
 
 
+def evidence_header(item) -> str:
+    """The ``[E#] source — locator`` line that heads one evidence block.
+
+    A web source is described by its title, domain, and section — deliberately
+    NOT by its full URL. The model never needs to reproduce a link: citations
+    are rendered afterwards from this evidence's stored metadata, so keeping
+    the raw URL out of the prompt removes the only way it could echo a wrong
+    one back.
+    """
+    ref = f"[{item.ref}]" if item.ref else "[E?]"
+    if getattr(item, "is_url", False):
+        domain = item.domain
+        head = f"{ref} {item.source_label_ar}"
+        if domain:
+            head += f" — {domain}"
+        section = (item.section_title or "").strip()
+        return f"{head} · {section}" if section else head
+    return f"{ref} {item.document_name} — {item.pages_label_ar}"
+
+
 def build_context(evidence: list, *, max_chars: int = MAX_CASE_CONTEXT_CHARS) -> str:
     """Reference-tagged, hard-bounded evidence block for the prompt.
 
-    Each block is headed with its ``[E#]`` reference, document name, and page
-    range so the model can cite by reference and the citations can later be
-    resolved back to real chunks.
+    Each block is headed with its ``[E#]`` reference and its provenance (page
+    range for a document, title/section for a web page) so the model can cite
+    by reference and the citations can later be resolved back to real chunks.
     """
     max_chars = max(1, int(max_chars))
     parts: list[str] = []
     used = 0
 
     for item in evidence:
-        header = f"[{item.ref}] {item.document_name} — {item.pages_label_ar}"
+        header = evidence_header(item)
         body = (item.text or "").strip()
         block = f"{header}\n{body}"
 
@@ -234,9 +266,15 @@ def resolve_refs(evidence: list, refs) -> list:
 def summarize(evidence: list) -> dict:
     """Content-free counters for diagnostics and logging."""
     documents = {e.document_id for e in evidence}
+    pdf_sources = {
+        e.document_id for e in evidence if getattr(e, "source_type", SOURCE_TYPE_PDF) != SOURCE_TYPE_URL
+    }
+    url_sources = {e.document_id for e in evidence if getattr(e, "is_url", False)}
     return {
         "num_evidence": len(evidence),
         "num_documents": len(documents),
+        "num_pdf_sources": len(pdf_sources),
+        "num_url_sources": len(url_sources),
         "num_strong": sum(1 for e in evidence if e.strength == STRENGTH_STRONG),
         "num_supporting": sum(
             1 for e in evidence if e.strength == STRENGTH_SUPPORTING

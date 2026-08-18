@@ -16,15 +16,17 @@ the demo server or ask questions answered by a hosted LLM with page citations.
 Browser
   → Streamlit (this app, bound 0.0.0.0:7860)
       → per-session temporary storage: /tmp/mudqeq_demo/<session_id>/
-      → PDF validation (untrusted input hardening)
-      → pdfplumber extraction (generic, no OCR)
-      → chunking (page-tagged)
+      → a source is either an uploaded PDF or an added link:
+          PDF: validation → pdfplumber extraction (generic, no OCR)
+                          → chunking (page-tagged)
+          URL: SSRF-checked fetch → readable-content extraction
+                          → chunking (section-tagged)
       → multilingual-e5-small embeddings (on the demo server)
-      → FAISS IndexFlatIP (per session)
-      → Top-K retrieval
+      → FAISS IndexFlatIP (one index per source, per session)
+      → Top-K retrieval across the selected sources
       → bounded RAG context (+ prompt-injection defense)
       → OpenAI hosted LLM (chat only)
-      → answer + citations
+      → answer + citations (page number for files, page title + link for URLs)
 ```
 
 The embedding model runs **on the demo server**. Only the **question + a
@@ -39,10 +41,49 @@ page works entirely on the server with **no external LLM call**.
 |--------|------------------------------|-----------|
 | App start | Hugging Face (only if model NOT baked in image) | Model files (no user data) |
 | Upload / Extract / Index / **Search** | none | none leaves the server |
+| **Add link** | the page's own host, once | An HTTP GET issued by the server; no user data beyond the address the user typed |
 | **Chat** | OpenAI API (`api.openai.com`) | Question + minimum Top-K retrieved chunks + page numbers |
 | **Case analysis** | OpenAI API (`api.openai.com`) | Case description + structured case + bounded retrieved evidence + page numbers |
 
-The full PDF is **never** sent to any LLM. See `services/llm_service.py`.
+The full PDF, and the full fetched web page, are **never** sent to any LLM. See
+`services/llm_service.py`.
+
+---
+
+## Sources: files and links
+
+A "source" is either an uploaded PDF or a fetched web page. Both live in one
+list, share one id space, and are selected together, so any combination — one
+file, several files, several links, or a mix — is just a selection.
+
+```
+link
+  → validate + SSRF check (scheme, port, host, resolved IPs)
+  → fetch (streamed, size-capped, redirect chain re-validated hop by hop)
+  → content-type check (text/html or text/plain)
+  → readable-content extraction (boilerplate, scripts, nav, hidden nodes dropped)
+  → chunking → embeddings → FAISS   ← the same pipeline PDFs already use
+```
+
+| Concern | How it is handled |
+|---------|-------------------|
+| SSRF | Only public http(s) on ports 80/443. Loopback, private, link-local, and cloud-metadata addresses are refused before connecting **and** on every redirect |
+| Memory | Response bytes capped while streaming (`MAX_URL_RESPONSE_BYTES`), extracted text capped (`MAX_URL_EXTRACTED_CHARS`), chunks capped (`MAX_URL_CHUNKS`) |
+| Hangs | Separate connect/read timeouts, bounded redirect count |
+| Citations | The link shown is the address the server actually fetched, read from stored metadata — the model is never given a URL it could paraphrase |
+| Injection | Page text is fenced as untrusted data exactly like PDF text; instructions inside a page are quoted, never executed |
+| Staleness | `retrieved_at` is stored and displayed; **تحديث المحتوى** re-fetches and rebuilds that one source's index |
+| Duplicates | Canonicalised URL hash per session; re-adding the same page is refused |
+| Deletion | Removing a link deletes its record, chunks, and FAISS index and nothing else |
+
+Implementation: `services/url_security_service.py` (validation/SSRF),
+`services/url_fetch_service.py` (bounded fetch), `core/html_extract.py`
+(readable content), `services/url_source_service.py` (ingest orchestration),
+`core/source_models.py` (shared source vocabulary).
+
+Not supported in this version: JavaScript-rendered pages (no browser engine is
+used — the user gets a clear "no readable content" message), PDFs behind a link
+(the user is asked to upload the file instead), and any non-text content type.
 
 ---
 
@@ -103,9 +144,18 @@ Implementation: `core/case_models.py`, `services/case_analysis_service.py`,
 | `MAX_RESULTS_PER_QUERY` | No | `5` | Chunks retrieved per research query |
 | `MAX_TOTAL_EVIDENCE_CHUNKS` | No | `18` | Evidence kept after de-duplication |
 | `MAX_CASE_CONTEXT_CHARS` | No | `14000` | Evidence context sent per case call |
-| `MAX_CASE_LLM_CALLS` | No | `4` | Provider calls per successful analysis |
+| `MAX_CASE_LLM_CALLS` | No | `5` | Provider calls per successful analysis (incl. verify) |
 | `MAX_CASES_PER_SESSION` | No | `3` | Case-analysis quota per session |
 | `MAX_CASE_FOLLOWUPS_PER_CASE` | No | `5` | Follow-up questions per case |
+| `MAX_URL_SOURCES_PER_SESSION` | No | `5` | Live link sources per session |
+| `MAX_URLS_PER_SESSION` | No | `15` | Outbound page fetches per session (adds + refreshes) |
+| `MAX_URL_RESPONSE_BYTES` | No | `5000000` | Hard cap on bytes read from a page |
+| `MAX_URL_EXTRACTED_CHARS` | No | `400000` | Cap on readable text kept after extraction |
+| `MIN_URL_EXTRACTED_CHARS` | No | `200` | Below this a page counts as unreadable |
+| `URL_CONNECT_TIMEOUT` | No | `5` | Connect timeout (seconds) |
+| `URL_READ_TIMEOUT` | No | `15` | Read timeout (seconds) |
+| `MAX_URL_REDIRECTS` | No | `3` | Redirect hops, each re-validated |
+| `MAX_URL_CHUNKS` | No | `600` | Chunks indexed per page |
 
 **Never** put `OPENAI_API_KEY` in source, git, or README — only:
 - **Local:** `web_demo/.env` (gitignored)

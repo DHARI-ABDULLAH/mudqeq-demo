@@ -173,19 +173,25 @@ def delete_document(session_id: str, document_id: str) -> None:
 
 
 def diagnostics(session_id: str) -> list[dict]:
-    """Content-free health report for every document in the session.
+    """Content-free health report for every source in the session.
 
-    Safe to render in the UI: no document text, no chunk text, no secrets.
+    Covers PDFs and URL sources alike — they share one index format, so they
+    share one health report. Safe to render in the UI: no document text, no
+    page text, no addresses beyond the source's own domain, no secrets.
     """
     security.require_valid_id(session_id)
+    lister = getattr(session_service, "list_sources", session_service.list_documents)
     out: list[dict] = []
-    for doc in session_service.list_documents(session_id):
+    for doc in lister(session_id):
         entry = {
             "document_id": doc.document_id,
+            "source_type": getattr(doc, "source_type", "pdf"),
             "status": doc.status,
             "num_pages": doc.num_pages,
             "num_chunks": doc.num_chunks,
         }
+        if getattr(doc, "is_url", False):
+            entry["domain"] = doc.domain
         entry.update(retrieval_service.index_diagnostics(session_id, doc.document_id))
         out.append(entry)
     return out

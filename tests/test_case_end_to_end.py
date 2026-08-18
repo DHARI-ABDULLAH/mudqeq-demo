@@ -297,11 +297,12 @@ def test_follow_up_answers_from_the_same_evidence(e2e_outcome):
 def test_full_run_stays_within_the_call_budget(e2e_outcome):
     outcome, _, _, _, recorder = e2e_outcome
 
-    assert outcome.llm_calls == 4
+    assert outcome.llm_calls == 5
     assert outcome.llm_calls <= cas.max_llm_calls_per_case()
     assert recorder.stages == [
         case_fakes.UNDERSTAND,
         case_fakes.PLAN,
         case_fakes.SOLUTIONS,
         case_fakes.REPORT,
+        case_fakes.VERIFY,
     ]

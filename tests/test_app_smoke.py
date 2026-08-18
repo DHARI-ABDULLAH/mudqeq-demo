@@ -34,7 +34,7 @@ def test_sidebar_navigation_and_top_k_slider():
     for expected in [
         "المحادثة",
         "تحليل حالة",
-        "المستندات",
+        "المصادر",
         "البحث",
         "حول النسخة التجريبية",
     ]:
@@ -61,7 +61,7 @@ def test_pages_render_without_exception():
         "تحليل حالة",
         "البحث",
         "حول النسخة التجريبية",
-        "المستندات",
+        "المصادر",
     ]:
         button = next(b for b in at.sidebar.button if b.label == label)
         button.click().run()

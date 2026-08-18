@@ -38,7 +38,15 @@ from config import (
     MAX_FILES_PER_SESSION,
     MAX_QUESTIONS_PER_SESSION,
     MAX_UPLOADS_PER_SESSION,
+    MAX_URL_SOURCES_PER_SESSION,
+    MAX_URLS_PER_SESSION,
     SESSION_TTL_MINUTES,
+)
+from core.source_models import (
+    SOURCE_TYPE_PDF,
+    SOURCE_TYPE_URL,
+    domain_of,
+    normalize_source_type,
 )
 from services import security
 
@@ -50,6 +58,16 @@ STATUS_ERROR = "error"
 
 @dataclass
 class DocumentRecord:
+    """One source in a session: an uploaded PDF or a fetched web page.
+
+    The name is historical — PDFs were the only source when it was written, and
+    the whole application addresses sources by ``document_id``. Rather than
+    rename that concept everywhere (and break every caller), URL sources reuse
+    this record with ``source_type="url"`` and the web fields filled in. A
+    record that says nothing about its type is a PDF, exactly as before, so
+    every existing caller keeps its meaning.
+    """
+
     document_id: str
     display_name: str
     num_pages: int = 0
@@ -57,6 +75,31 @@ class DocumentRecord:
     status: str = STATUS_PROCESSING  # processing | ready | needs_ocr | error
     file_hash: str = ""
     created_at: float = field(default_factory=time.time)
+    # --- Source kind + web provenance (empty/default for PDFs) -------------
+    source_type: str = SOURCE_TYPE_PDF
+    original_url: str = ""
+    final_url: str = ""
+    page_title: str = ""
+    content_type: str = ""
+    retrieved_at: float = 0.0
+
+    @property
+    def source_id(self) -> str:
+        """Unified name for ``document_id`` (they are the same identifier)."""
+        return self.document_id
+
+    @property
+    def is_url(self) -> bool:
+        return normalize_source_type(self.source_type) == SOURCE_TYPE_URL
+
+    @property
+    def url(self) -> str:
+        """The address a citation should link to (final beats original)."""
+        return self.final_url or self.original_url
+
+    @property
+    def domain(self) -> str:
+        return domain_of(self.url)
 
 
 @dataclass
@@ -69,6 +112,9 @@ class SessionRecord:
     # Case analyses are a separate, much more expensive operation, so they are
     # metered on their own counter instead of draining the question quota.
     cases: int = 0
+    # Outbound page fetches (adds + refreshes), metered separately from uploads
+    # because each one costs the SERVER a network request.
+    url_fetches: int = 0
     documents: dict[str, DocumentRecord] = field(default_factory=dict)
 
 
@@ -151,42 +197,88 @@ def has_document(session_id: str, document_id: str) -> bool:
     return get_document(session_id, document_id) is not None
 
 
-def list_documents(session_id: str) -> list[DocumentRecord]:
-    """All documents in the session, newest first (any status)."""
+def list_sources(session_id: str) -> list[DocumentRecord]:
+    """Every source in the session — PDFs and URLs — newest first."""
     with _lock:
         rec = _sessions.get(session_id)
         if rec is None:
             return []
-        docs = list(rec.documents.values())
-    docs.sort(key=lambda d: d.created_at, reverse=True)
-    return docs
+        sources = list(rec.documents.values())
+    sources.sort(key=lambda d: d.created_at, reverse=True)
+    return sources
+
+
+def list_documents(session_id: str) -> list[DocumentRecord]:
+    """Uploaded PDF documents only, newest first (any status).
+
+    Kept PDF-only on purpose: the upload cap, the page counters, and the
+    upload-side callers all mean "files", and URL sources must not silently
+    consume a document slot. Use :func:`list_sources` for the unified view.
+    """
+    return [d for d in list_sources(session_id) if not d.is_url]
+
+
+def list_url_sources(session_id: str) -> list[DocumentRecord]:
+    """Web page sources only, newest first (any status)."""
+    return [d for d in list_sources(session_id) if d.is_url]
+
+
+def ready_sources(session_id: str) -> list[DocumentRecord]:
+    """Every source that finished indexing (usable in chat/search/case)."""
+    return [d for d in list_sources(session_id) if d.status == STATUS_READY]
 
 
 def ready_documents(session_id: str) -> list[DocumentRecord]:
-    """Only documents that finished indexing (usable in chat/search)."""
-    return [d for d in list_documents(session_id) if d.status == STATUS_READY]
+    """Only PDF documents that finished indexing."""
+    return [d for d in ready_sources(session_id) if not d.is_url]
 
 
-def find_by_hash(session_id: str, file_hash: str) -> Optional[DocumentRecord]:
+def ready_url_sources(session_id: str) -> list[DocumentRecord]:
+    """Only URL sources that finished indexing."""
+    return [d for d in ready_sources(session_id) if d.is_url]
+
+
+def get_source(session_id: str, source_id: str) -> Optional[DocumentRecord]:
+    """Unified alias for :func:`get_document` (same ownership guarantee)."""
+    return get_document(session_id, source_id)
+
+
+def find_by_hash(
+    session_id: str, file_hash: str, source_type: Optional[str] = None
+) -> Optional[DocumentRecord]:
+    """Find a source by its content/URL hash, optionally within one kind."""
     if not file_hash:
         return None
+    wanted = normalize_source_type(source_type) if source_type else None
     with _lock:
         rec = _sessions.get(session_id)
         if rec is None:
             return None
         for doc in rec.documents.values():
-            if doc.file_hash and doc.file_hash == file_hash:
-                return doc
+            if not doc.file_hash or doc.file_hash != file_hash:
+                continue
+            if wanted is not None and normalize_source_type(doc.source_type) != wanted:
+                continue
+            return doc
     return None
 
 
+def find_url_source(session_id: str, url_hash: str) -> Optional[DocumentRecord]:
+    """Find an existing URL source by its canonical-URL hash."""
+    return find_by_hash(session_id, url_hash, source_type=SOURCE_TYPE_URL)
+
+
 def remove_document(session_id: str, document_id: str) -> None:
-    """Drop a document's record and delete its files from disk."""
+    """Drop a source's record and delete its files from disk."""
     with _lock:
         rec = _sessions.get(session_id)
         if rec is not None:
             rec.documents.pop(document_id, None)
     _delete_document_files(session_id, document_id)
+
+
+# Unified alias — deletion is identical for both source kinds.
+remove_source = remove_document
 
 
 def _delete_document_files(session_id: str, document_id: str) -> None:
@@ -205,10 +297,15 @@ def _delete_document_files(session_id: str, document_id: str) -> None:
 
 # --- Stats (session-only; never global) -----------------------------------
 def stats(session_id: str) -> dict:
-    ready = ready_documents(session_id)
+    ready = ready_sources(session_id)
+    pdfs = [d for d in ready if not d.is_url]
+    urls = [d for d in ready if d.is_url]
     return {
-        "num_documents": len(ready),
-        "total_pages": sum(d.num_pages for d in ready),
+        # Unchanged meaning: uploaded files only.
+        "num_documents": len(pdfs),
+        "num_urls": len(urls),
+        "num_sources": len(ready),
+        "total_pages": sum(d.num_pages for d in pdfs),
         "total_chunks": sum(d.num_chunks for d in ready),
     }
 
@@ -229,14 +326,50 @@ def record_upload(session_id: str) -> None:
 
 
 def live_document_count(session_id: str) -> int:
-    with _lock:
-        rec = _sessions.get(session_id)
-        return len(rec.documents) if rec else 0
+    """Concurrent uploaded PDFs. URL sources have their own, separate cap."""
+    return len(list_documents(session_id))
 
 
 def has_document_slot(session_id: str) -> bool:
     """Enforce MAX_FILES_PER_SESSION (concurrent live documents)."""
     return live_document_count(session_id) < MAX_FILES_PER_SESSION
+
+
+# --- URL source quotas (separate from the upload quotas) ------------------
+def live_url_count(session_id: str) -> int:
+    return len(list_url_sources(session_id))
+
+
+def has_url_slot(session_id: str) -> bool:
+    """Enforce MAX_URL_SOURCES_PER_SESSION (concurrent live URL sources)."""
+    return live_url_count(session_id) < MAX_URL_SOURCES_PER_SESSION
+
+
+def can_fetch_url(session_id: str) -> bool:
+    """Whether another outbound page fetch (add or refresh) is allowed."""
+    with _lock:
+        rec = _sessions.get(session_id)
+        if rec is None:
+            return True
+        return rec.url_fetches < MAX_URLS_PER_SESSION
+
+
+def record_url_fetch(session_id: str) -> None:
+    """Charge one outbound fetch. Called before the request goes out."""
+    with _lock:
+        rec = get_or_create(session_id)
+        rec.url_fetches += 1
+
+
+def remaining_url_fetches(session_id: str) -> int:
+    with _lock:
+        rec = _sessions.get(session_id)
+        used = rec.url_fetches if rec else 0
+        return max(0, MAX_URLS_PER_SESSION - used)
+
+
+def remaining_url_slots(session_id: str) -> int:
+    return max(0, MAX_URL_SOURCES_PER_SESSION - live_url_count(session_id))
 
 
 def can_ask(session_id: str) -> bool:

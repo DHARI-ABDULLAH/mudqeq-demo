@@ -99,6 +99,12 @@ html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {{
 }}
 .src-head {{ font-weight: 700; color: var(--navy); }}
 .src-score {{ float: left; color: var(--gold); font-weight: 700; }}
+/* Links out to a URL source's original page */
+.src-link, .doc-link {{
+  font-size: 0.82rem; font-weight: 600; color: var(--navy);
+  text-decoration: underline; text-underline-offset: 3px;
+}}
+.doc-link {{ display: inline-block; margin-top: 0.4rem; }}
 
 /* Badges */
 .badge {{ display:inline-block; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem; font-weight: 700; }}
@@ -115,6 +121,38 @@ html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {{
 }}
 .hero h1 {{ color: var(--gold); margin: 0 0 0.3rem 0; font-size: 1.9rem; }}
 .hero p {{ color: #cdd7e4; margin: 0; line-height: 1.8; }}
+
+/* Streamlit Community Cloud header icons (GitHub / Edit / Star / Share).
+   The host injects these via SET_TOOLBAR_ITEMS into the app header toolbar.
+   Selectors target stable data-testid/class hooks from Streamlit 1.61+. */
+[data-testid="stToolbarActions"],
+[data-testid="stToolbarActionButton"],
+.stToolbarActions,
+.stToolbarActionButton {{
+  display: none !important;
+  visibility: hidden !important;
+  height: 0 !important;
+  max-height: 0 !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
+  opacity: 0 !important;
+}}
+
+/* Fallback: hide the entire top-right toolbar strip (not the app sidebar). */
+[data-testid="stHeader"] [data-testid="stToolbar"] {{
+  display: none !important;
+  visibility: hidden !important;
+  height: 0 !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
+}}
+
+[data-testid="stHeader"] {{
+  height: auto !important;
+  min-height: 0 !important;
+  background: transparent !important;
+}}
 </style>
 """
 
